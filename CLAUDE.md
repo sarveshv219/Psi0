@@ -93,6 +93,26 @@ find "$HF_LEROBOT_HOME"/vibe_repose_g1_val -name '*.parquet' | wc -l   # expect 
 693 MB). `UV_HTTP_TIMEOUT=600 UV_CONCURRENT_DOWNLOADS=2` fixes it; uv banks successful wheels, so
 repeating the same command makes progress rather than restarting.
 
+**5. On old glibc, `rerun-sdk` blocks the whole sync — and it is unreachable code.** RHEL-8-class
+clusters (CARC) are `manylinux_2_28`; Ubuntu 24.04 is 2.39, so this only appears off the dev box:
+
+```
+error: Distribution `rerun-sdk==0.22.1` can't be installed because it doesn't have a
+source distribution or wheel for the current platform
+```
+
+There is **no version that satisfies both constraints**: `lerobot` caps it at `<0.23.0,>=0.21.0`,
+and rerun-sdk published no `manylinux_2_28` wheel until **0.31.3**. Don't try to upgrade past the
+cap. Skip it instead — `uv sync --no-install-package rerun-sdk`, already in `mode_setup`.
+
+Safe because nothing on the training path loads it: importing `LeRobotDataset` leaves `rerun` out
+of `sys.modules`, the only lerobot modules that import it are `visualize_dataset`, `teleoperate`,
+`record`, and `visualization_utils`, and `psi` imports exactly one lerobot module
+(`datasets.lerobot_dataset`). It would break `lerobot`'s own visualization CLIs, which we never run.
+
+**Not a trap:** `warning: transformers==4.57.0 is yanked`. The pin is upstream's, uv installs it
+anyway, and it is the version everything here was verified against. Leave it.
+
 ## The corpus pipeline
 
 Lives in `scripts/data/vibe/` — **read its README before touching any of it**; it holds every

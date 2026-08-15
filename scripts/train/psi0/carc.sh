@@ -122,9 +122,17 @@ mode_setup() {
     # UV_HTTP_TIMEOUT/CONCURRENT_DOWNLOADS: torch drags ~3 GB of bundled CUDA libs from
     # pypi.nvidia.com (cudnn alone is 693 MB) and the default timeout expires mid-wheel.
     # uv banks completed wheels, so re-running this makes progress rather than restarting.
+    # --no-install-package rerun-sdk: CARC is glibc 2.28 (manylinux_2_28) and rerun-sdk has no
+    # 2_28 wheel between 0.23 and 0.31.3, while lerobot caps it at <0.23.0 -- so NO version
+    # satisfies both and `uv sync` hard-fails on a package we never load. Verified: importing
+    # LeRobotDataset leaves `rerun` out of sys.modules; the only lerobot files that touch it are
+    # visualize_dataset / teleoperate / record / visualization_utils, and psi imports none of
+    # them. If a future lerobot lifts the cap, prefer `[tool.uv] override-dependencies =
+    # ["rerun-sdk>=0.31.3"]` over this flag.
     UV_PROJECT_ENVIRONMENT="$VENV" GIT_LFS_SKIP_SMUDGE=1 \
     UV_HTTP_TIMEOUT=600 UV_CONCURRENT_DOWNLOADS=2 uv sync \
-        --group serve --group viz --group psi --index-strategy unsafe-best-match
+        --group serve --group viz --group psi --index-strategy unsafe-best-match \
+        --no-install-package rerun-sdk
 
     # flash-attn has no manylinux wheel for this interpreter: PyPI serves an sdist and it
     # COMPILES, for tens of minutes, against nvcc. MAX_JOBS is not tuning -- unbounded nvcc
