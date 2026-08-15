@@ -144,14 +144,24 @@ mode_setup() {
     # importability, so a broken-but-present flash_attn makes every such guard return True.
     # sonic.py falls back to sdpa on its own; at 100 VLM tokens the difference is noise.
     #
-    # To insist on flash-attn, force a real compile (tens of minutes, needs nvcc + gcc, and
-    # MAX_JOBS is not tuning -- unbounded nvcc parallelism OOMs the build):
-    #     salloc -c 8 --mem 32G -t 2:00:00
-    #     FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=4 uv pip install \
-    #         flash_attn==2.7.4.post1 --no-build-isolation
+    # --no-deps IS LOAD-BEARING. flash-attn declares a bare, unbounded `torch`, so any install
+    # of it is licensed to re-resolve the pinned stack. Adding --reinstall once dragged CARC
+    # from torch 2.7.0+cu126 to 2.13.0+cu130, which then failed the flash-attn build against a
+    # cuda/12.6 module. Never install this package without --no-deps.
+    #
+    # To insist on flash-attn, build the wheel yourself -- FLASH_ATTENTION_FORCE_BUILD does not
+    # survive uv's PEP 517 subprocess, and the arch var is FLASH_ATTN_CUDA_ARCHS (setup.py:69),
+    # NOT TORCH_CUDA_ARCH_LIST, with branches for only 80/90/100/120. "80" covers sm_86/sm_89
+    # too: cubins are binary-compatible across minor versions within a major arch.
+    #     salloc -c 8 --mem 32G -t 2:00:00 && module load gcc cuda
+    #     curl -sL https://files.pythonhosted.org/packages/source/f/flash-attn/\
+    #         flash_attn-2.7.4.post1.tar.gz | tar xz && cd flash_attn-2.7.4.post1
+    #     FLASH_ATTENTION_FORCE_BUILD=TRUE FLASH_ATTN_CUDA_ARCHS=80 MAX_JOBS=4 NVCC_THREADS=2 \
+    #         $VENV/bin/python setup.py bdist_wheel
+    #     uv pip install dist/flash_attn-*.whl --no-deps --python $VENV/bin/python
     if [[ ${PSI0_SKIP_FLASH_ATTN:-0} != 1 ]]; then
         MAX_JOBS=${MAX_JOBS:-4} VIRTUAL_ENV="$VENV" \
-            uv pip install flash_attn==2.7.4.post1 --no-build-isolation || true
+            uv pip install flash_attn==2.7.4.post1 --no-build-isolation --no-deps || true
         if "$VENV/bin/python" -c "import flash_attn" 2>/dev/null; then
             echo "[setup] flash_attn OK"
         else

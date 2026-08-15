@@ -130,9 +130,30 @@ and every guard built on it — including `psi0.py:1533`'s — fails open.
 
 The cost is ~nothing. The VLM is frozen at **100 tokens** (80 image + prompt), far below where
 flash-attn's tiling pays, and it is the only module that requests a backend; the action expert
-uses diffusers' attention processors. To insist anyway: `FLASH_ATTENTION_FORCE_BUILD=TRUE
-MAX_JOBS=4 uv pip install flash_attn==2.7.4.post1 --no-build-isolation`, in an allocation, with
-`nvcc` and `gcc` loaded. Or set `PSI0_SKIP_FLASH_ATTN=1` to skip the attempt entirely.
+uses diffusers' attention processors. `PSI0_SKIP_FLASH_ATTN=1` skips the attempt entirely.
+
+**Never install flash-attn without `--no-deps`.** It declares a bare, unbounded `torch`, so any
+install of it may re-resolve the pinned stack — adding `--reinstall` once took CARC from
+`2.7.0+cu126` to **`2.13.0+cu130`**, silently, and the next build then failed against a `cuda/12.6`
+module with a "detected CUDA version mismatches" error that looks like a module problem and isn't.
+Recover with `uv sync` (declarative against `uv.lock`), not with more `uv pip install`.
+
+To build it for real, do it yourself — **`FLASH_ATTENTION_FORCE_BUILD` does not survive uv's
+PEP 517 subprocess**, so `uv pip install` silently downloads the prebuilt wheel no matter what:
+
+```bash
+salloc -c 8 --mem 32G -t 2:00:00 && module load gcc cuda      # cuda 12.x, gcc <= 13
+curl -sL https://files.pythonhosted.org/packages/source/f/flash-attn/flash_attn-2.7.4.post1.tar.gz | tar xz
+cd flash_attn-2.7.4.post1
+FLASH_ATTENTION_FORCE_BUILD=TRUE FLASH_ATTN_CUDA_ARCHS=80 MAX_JOBS=4 NVCC_THREADS=2 \
+    $VENV/bin/python setup.py bdist_wheel
+uv pip install dist/flash_attn-*.whl --no-deps --python $VENV/bin/python
+```
+
+The arch variable is **`FLASH_ATTN_CUDA_ARCHS`** (`setup.py:69`), *not* `TORCH_CUDA_ARCH_LIST`,
+which this package never reads. Its only branches are `80/90/100/120` — there is no `89`, and none
+is needed: cubins are binary-compatible across minor versions within a major arch, so `80` runs on
+sm_86 and sm_89. Watch the first lines — `Guessing wheel URL:` means it is still downloading.
 
 **Not a trap:** `warning: transformers==4.57.0 is yanked`. The pin is upstream's, uv installs it
 anyway, and it is the version everything here was verified against. Leave it.
