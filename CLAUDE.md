@@ -300,11 +300,31 @@ and DDP raises only on `None` grads, which local runs already rule out.
 across GPUs, because the static footprint is ~13 GB and activations are only ~0.04 GB/sample.
 
 ```bash
-bash carc.sh setup                     # login node, once: uv venv + deps + checkpoints
+salloc -c 8 --mem 32G -t 2:00:00       # flash-attn COMPILES; do not do it on a login node
+bash carc.sh setup                     # once: uv venv + deps + checkpoints
+exit
+bash carc.sh data                      # login node: pull the corpus, verify the counts
 bash carc.sh smoke -g l40s             # 20 steps. DO THIS FIRST on any new cluster
 bash carc.sh submit -g l40s -t 48 -- <exp> [OVR...]
 bash carc.sh sweep  -g l40s --manifest runs.tsv    # job array, 1 GPU per element
 ```
+
+The four bring-up traps above are now **implemented in the launcher**, not left to the operator:
+`setup_ffmpeg()` runs in both `mode_setup` and `setup_run_env` and **fails the job immediately**
+if no `libavutil.so.5{6,7,8,9}` is on the loader path; `mode_data` disables Xet, caps workers, and
+verifies parquet counts because the download exits 0 when throttled; `uv sync` carries the timeout
+settings; flash-attn gets `MAX_JOBS=4` and warns outside an allocation. Escape hatches:
+
+| var | effect |
+|---|---|
+| `PSI0_FFMPEG_DIR` | prefix with `lib/libavutil.so.5x`; skips the `module load` hunt entirely |
+| `FFMPEG_MODULES` | module names to try, in order (default covers `ffmpeg/4.4`–`6.1.1`) |
+| `PSI0_HF_ONLINE=1` | undo the default `HF_HUB_OFFLINE=1` if a run must reach the hub |
+| `HF_DATASET` | override the dataset repo `mode_data` pulls |
+
+`setup_run_env` also runs one real CUDA kernel before training starts. An arch mismatch otherwise
+surfaces as `no kernel image is available` on `sonic.py`'s `loss_w` tensor, minutes in and with the
+traceback buried inside a `ChildFailedError`.
 
 ### Modules
 
@@ -313,7 +333,7 @@ and `module purge` first so nothing is inherited from the login shell.
 
 | when | module | why |
 |---|---|---|
-| **every job** | `ffmpeg` | torchcodec, see trap 2 above. Must load *inside* the allocation — it belongs in `setup_run_env()`, not just at submit time |
+| **every job** | `ffmpeg` | torchcodec, see trap 2 above. Loaded *inside* the allocation by `setup_run_env()`; `module purge` runs first so a login shell's modules are not inherited |
 | setup only | CUDA toolkit (`nvcc`) + `gcc` | **flash-attn compiles from source** — PyPI ships only an sdist, and the installed wheel here is tagged `cp310-cp310-linux_x86_64`, not manylinux. Expect a long build; cap it with `MAX_JOBS=4` or it OOMs, and run it in an interactive job, not on a login node |
 | setup only | `git` / `git-lfs` | the clone (`GIT_LFS_SKIP_SMUDGE=1` is already in `mode_setup`) |
 
@@ -328,7 +348,9 @@ needed on a cluster either), with `LD_LIBRARY_PATH` exported in `setup_run_env()
 ### `.env` is machine-specific
 
 The local `.env` hardcodes `/home/sarvesh/gyms/Psi0/...` into `HF_LEROBOT_HOME` and `DATA_HOME`;
-**write a fresh one on CARC rather than copying it.** `carc.sh` exports `PSI_HOME` and `HF_HOME`
+**never copy it to CARC.** `mode_setup` writes a fresh one with cluster paths when none exists —
+you only fill in `HF_TOKEN` and `WANDB_API_KEY`. Note `train.py:4` asserts `load_dotenv()` is
+truthy, so an absent *or empty* `.env` is a hard failure. `carc.sh` exports `PSI_HOME` and `HF_HOME`
 itself before Python starts and `load_dotenv()` does not override already-set vars, so those two
 survive — but the rest would silently point at paths that do not exist.
 

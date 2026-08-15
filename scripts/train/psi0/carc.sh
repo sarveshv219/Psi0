@@ -9,6 +9,12 @@
 #
 #   setup   bash carc.sh setup
 #           Login node, once: uv venv + deps + pretrained checkpoints.
+#           flash-attn compiles from source -- run this in an interactive job
+#           (salloc -c 8 --mem 32G -t 2:00:00), not on a login node.
+#
+#   data    bash carc.sh data
+#           Login node, once: pull the LeRobot corpus from the HF dataset repo
+#           and VERIFY the file counts. A rate-limited download exits 0.
 #
 #   smoke   bash carc.sh smoke -g l40s
 #           20 steps, validation at 10. RUN THIS FIRST — no complete optimizer
@@ -55,6 +61,47 @@ DEF_GPU=l40s DEF_N=1 DEF_HOURS=24 DEF_BATCH=32 DEF_STEPS=40000 DEF_PART=gpu
 CKPT_VLM=psi0/pre.fast.1by1.2601091803.ckpt.ego200k.he30k
 CKPT_HEAD=psi0/postpre.1by1.pad36.2601131206.ckpt.he30k
 
+HF_DATASET=${HF_DATASET:-sarveshv219/vibe-repose-sim}
+N_TRAIN_EP=3246 N_VAL_EP=573
+
+# torchcodec dlopens libavutil.so.5{6,7,8,9} by soname at FIRST DECODE, which is inside a
+# DataLoader worker on batch 1 -- i.e. after the 4 GB VLM has loaded and the allocation is
+# already spent. pip cannot supply these (imageio-ffmpeg ships a static binary, PyAV ships
+# hash-mangled sonames). Resolve them BEFORE python starts; glibc caches the search path at
+# process startup, so exporting this from inside Python or from .env is too late.
+#
+# Set PSI0_FFMPEG_DIR to a prefix with lib/libavutil.so.5x to skip the module hunt, e.g. a
+# conda env made with: conda create -y -p $ROOT/ffmpeg6 -c conda-forge 'ffmpeg=6.1'
+FFMPEG_MODULES=${FFMPEG_MODULES:-"ffmpeg ffmpeg/6.1.1 ffmpeg/6.0 ffmpeg/5.1.2 ffmpeg/4.4"}
+
+setup_ffmpeg() {
+    if [[ -n ${PSI0_FFMPEG_DIR:-} ]]; then
+        export PATH="$PSI0_FFMPEG_DIR/bin:$PATH"
+        export LD_LIBRARY_PATH="$PSI0_FFMPEG_DIR/lib:${LD_LIBRARY_PATH:-}"
+        echo "[ffmpeg] PSI0_FFMPEG_DIR=$PSI0_FFMPEG_DIR"
+    elif command -v module >/dev/null 2>&1; then
+        local m
+        for m in $FFMPEG_MODULES; do
+            module load "$m" 2>/dev/null && { echo "[ffmpeg] module $m"; break; }
+        done
+    fi
+
+    # Verify rather than hope: this is the exact lookup torchcodec will do, and doing it here
+    # costs a second where failing later costs the job.
+    local found
+    found=$(ldconfig -p 2>/dev/null | grep -oE 'libavutil\.so\.5[6-9]' | head -1)
+    [[ -z $found && -n ${LD_LIBRARY_PATH:-} ]] && found=$(
+        ls ${LD_LIBRARY_PATH//:/ }/libavutil.so.5[6-9] 2>/dev/null | head -1)
+    if [[ -n $found ]]; then
+        echo "[ffmpeg] OK: $found"
+    else
+        echo "[ffmpeg] FATAL: no libavutil.so.5{6,7,8,9} on the loader path." >&2
+        echo "         torchcodec will crash a DataLoader worker on the first batch." >&2
+        echo "         Fix: module spider ffmpeg   OR   set PSI0_FFMPEG_DIR (see comment above)." >&2
+        return 1
+    fi
+}
+
 # =============================================================================
 # setup — login node, once
 # =============================================================================
@@ -71,13 +118,45 @@ mode_setup() {
 
     # NOT `uv sync --active`: --active reads $VIRTUAL_ENV, and with nothing activated
     # uv silently installs ~7 GB into the project default .venv instead.
-    UV_PROJECT_ENVIRONMENT="$VENV" GIT_LFS_SKIP_SMUDGE=1 uv sync \
+    #
+    # UV_HTTP_TIMEOUT/CONCURRENT_DOWNLOADS: torch drags ~3 GB of bundled CUDA libs from
+    # pypi.nvidia.com (cudnn alone is 693 MB) and the default timeout expires mid-wheel.
+    # uv banks completed wheels, so re-running this makes progress rather than restarting.
+    UV_PROJECT_ENVIRONMENT="$VENV" GIT_LFS_SKIP_SMUDGE=1 \
+    UV_HTTP_TIMEOUT=600 UV_CONCURRENT_DOWNLOADS=2 uv sync \
         --group serve --group viz --group psi --index-strategy unsafe-best-match
-    VIRTUAL_ENV="$VENV" uv pip install flash_attn==2.7.4.post1 --no-build-isolation
 
-    [[ -f $PSI/.env ]] || { echo "[fatal] no .env — copy .env.sample, set PSI_HOME/HF_TOKEN/WANDB_API_KEY"; exit 1; }
-    grep -q '^WANDB_API_KEY=.\+' "$PSI/.env" \
-        || echo "[warn] WANDB_API_KEY empty and the config passes --log.report_to=wandb"
+    # flash-attn has no manylinux wheel for this interpreter: PyPI serves an sdist and it
+    # COMPILES, for tens of minutes, against nvcc. MAX_JOBS is not tuning -- unbounded nvcc
+    # parallelism OOMs the build, and on a login node it will get your session killed.
+    if [[ -z ${SLURM_JOB_ID:-} ]]; then
+        echo "[warn] not in an allocation. flash-attn compiles from source here."
+        echo "[warn] prefer: salloc -c 8 --mem 32G -t 2:00:00, then re-run setup."
+    fi
+    command -v nvcc >/dev/null || echo "[warn] no nvcc on PATH — module load cuda before this"
+    MAX_JOBS=${MAX_JOBS:-4} VIRTUAL_ENV="$VENV" \
+        uv pip install flash_attn==2.7.4.post1 --no-build-isolation
+
+    # The local .env hardcodes /home/sarvesh paths; copying it points DATA_HOME and
+    # HF_LEROBOT_HOME at directories that do not exist here. Write a fresh one.
+    # train.py:4 asserts load_dotenv() is truthy, so an absent OR EMPTY .env is fatal there.
+    if [[ ! -f $PSI/.env ]]; then
+        echo "[setup] writing a CARC .env (fill in HF_TOKEN / WANDB_API_KEY)"
+        cat > "$PSI/.env" <<EOF
+HF_TOKEN=
+WANDB_API_KEY=
+WANDB_ENTITY=$WANDB_ENTITY
+PSI_HOME=$PSI_HOME
+DATA_HOME=$PSI/data
+HF_HOME=$ROOT/cache/hf
+HF_LEROBOT_HOME=$PSI/data/lerobot
+OMP_NUM_THREADS=$CPUS_PER_GPU
+TOKENIZERS_PARALLELISM=false
+TF_CPP_MIN_LOG_LEVEL=3
+EOF
+    fi
+    grep -q '^HF_TOKEN=.\+'      "$PSI/.env" || echo "[warn] HF_TOKEN empty — the dataset repo is private"
+    grep -q '^WANDB_API_KEY=.\+' "$PSI/.env" || echo "[warn] WANDB_API_KEY empty and the config passes --log.report_to=wandb"
 
     for d in "$CKPT_VLM" "$CKPT_HEAD"; do
         [[ -d $PSI_HOME/cache/checkpoints/$d ]] && { echo "[setup] have $d"; continue; }
@@ -85,11 +164,47 @@ mode_setup() {
             --repo-type=model --remote-dir="$d" --local-dir="$PSI_HOME/cache/checkpoints/$d"
     done
 
+    # `import torchcodec` is the real check: it is what runs load_torchcodec_shared_libraries()
+    # and raises "Could not load libtorchcodec". Training never hits it in the main process --
+    # only a DataLoader worker does -- so import it HERE, under the same loader path a job gets.
+    setup_ffmpeg || exit 1
     "$VENV/bin/python" -c "import psi, torch, torchcodec, flash_attn; print('[setup] imports OK', torch.__version__)"
-    [[ -d $PSI/data/lerobot/vibe_repose_g1 ]] \
-        || echo "[warn] no corpus at data/lerobot/vibe_repose_g1 — pull it from the HF dataset repo"
+
     mkdir -p "$PSI/logs/slurm/manifests"
-    echo "=== setup done. Next: bash carc.sh smoke -g l40s ==="
+    if [[ -d $PSI/data/lerobot/vibe_repose_g1 ]]; then
+        echo "=== setup done. Next: bash carc.sh smoke -g l40s ==="
+    else
+        echo "=== setup done. Next: bash carc.sh data ==="
+    fi
+}
+
+# =============================================================================
+# data — login node, once. Compute nodes should never reach for the network.
+# =============================================================================
+mode_data() {
+    cd "$PSI"
+    local dest=$PSI/data/lerobot
+    mkdir -p "$dest"
+
+    # HF_HUB_DISABLE_XET: the packed dataset is ~7,650 files and Xet requests a token PER FILE,
+    # which blows the 1000-per-5-minutes quota and 429s. --max-workers 4 keeps it under.
+    HF_HUB_DISABLE_XET=1 "$VENV/bin/hf" download "$HF_DATASET" --repo-type=dataset \
+        --local-dir "$dest" --max-workers 4 || true
+
+    # A rate-limited snapshot_download EXITS 0 and returns the partial directory, so the exit
+    # code above proves nothing. Count what actually landed; re-running resumes.
+    local ok=1 n
+    for pair in "vibe_repose_g1:$N_TRAIN_EP" "vibe_repose_g1_val:$N_VAL_EP"; do
+        n=$(find "$dest/${pair%%:*}" -name '*.parquet' 2>/dev/null | wc -l)
+        if [[ $n -eq ${pair##*:} ]]; then
+            echo "[data] ${pair%%:*}: $n parquet OK"
+        else
+            echo "[data] ${pair%%:*}: $n parquet, expected ${pair##*:}  <-- INCOMPLETE" >&2
+            ok=0
+        fi
+    done
+    (( ok )) || { echo "[fatal] partial download — re-run 'bash carc.sh data' until counts match"; exit 1; }
+    echo "=== data done. Next: bash carc.sh smoke -g l40s ==="
 }
 
 # =============================================================================
@@ -186,14 +301,47 @@ mode_sweep() {
 # =============================================================================
 setup_run_env() {
     cd "$PSI"
+
+    # Purge first: a login shell's modules are inherited by the batch script, and a stray
+    # python/cudnn/nccl module is worse than none -- torch bundles its own under
+    # site-packages/nvidia/ and a version-mismatched module silently shadows them.
+    if command -v module >/dev/null 2>&1; then module purge 2>/dev/null || true; fi
+    setup_ffmpeg || exit 1
+
     # shellcheck disable=SC1091
     source "$VENV/bin/activate"
     export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false
     export WANDB_PROJECT WANDB_ENTITY WANDB_DIR="$PSI/wandb"
     export HF_HOME=${HF_HOME:-$ROOT/cache/hf}
+
+    # Every checkpoint and every parquet is on local disk by now, so any hub call is either a
+    # revision check that can hang or a rate limit that can 429. Turn both into an immediate
+    # error. Set PSI0_HF_ONLINE=1 if a run genuinely needs to fetch something.
+    if [[ ${PSI0_HF_ONLINE:-0} != 1 ]]; then
+        export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
+    fi
+
     JOB_LOG_DIR=$PSI/logs/slurm/${SLURM_JOB_ID:-local}${SLURM_ARRAY_TASK_ID:+_$SLURM_ARRAY_TASK_ID}
     mkdir -p "$JOB_LOG_DIR" "$WANDB_DIR" "$HF_HOME"
     echo "=== $(hostname) | job ${SLURM_JOB_ID:-?} | $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1) | batch=$BATCH steps=$STEPS ==="
+
+    # Run one real kernel on the allocated card. If the wheel's CUDA variant does not cover this
+    # arch, the alternative is discovering it as "no kernel image is available" on the loss_w
+    # tensor in sonic.py, minutes in and with the traceback buried in a ChildFailedError.
+    python - <<'PY' || exit 1
+import torch, sys
+if not torch.cuda.is_available():
+    sys.exit("[preflight] FATAL: torch.cuda.is_available() is False")
+name = torch.cuda.get_device_name(0)
+cap  = "sm_%d%d" % torch.cuda.get_device_capability(0)
+try:
+    (torch.ones(8, device="cuda") * 2).sum().item()
+except RuntimeError as e:
+    sys.exit(f"[preflight] FATAL: {name} ({cap}) cannot run a kernel from torch "
+             f"{torch.__version__}\n  {e}\n  Reinstall torch for this arch "
+             f"(see CLAUDE.md 'Bringing up a new machine' trap 1).")
+print(f"[preflight] {name} {cap} OK, torch {torch.__version__}")
+PY
 }
 
 run_one() {  # run_one <gpu_idx> <exp> [ovr...]
@@ -285,11 +433,12 @@ mode_run_array() {  # run-array <batch> <steps> <snap>
     run_one 0 $line
 }
 
-usage() { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,/^# =\{20,\}$/p' "$0" | sed 's/^# \{0,1\}//'; }
 
 MODE=${1:-}; [[ $# -gt 0 ]] && shift
 case "$MODE" in
     setup)     mode_setup ;;
+    data)      mode_data ;;
     submit)    mode_submit "$@" ;;
     smoke)     mode_smoke "$@" ;;
     sweep)     mode_sweep "$@" ;;
