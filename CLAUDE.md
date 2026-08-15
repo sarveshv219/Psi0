@@ -31,7 +31,7 @@ Upstream: <https://github.com/physical-superintelligence-lab/Psi0>. `origin` is 
 | env | what | used by |
 |---|---|---|
 | `fcrl` conda (`/home/sarvesh/miniconda3/envs/fcrl/bin/python`) | mjlab / orcs / vibe / mocke | corpus steps 1–2, both probes |
-| `.venv-psi` (uv, py3.10) | psi, torch 2.7.0+cu126, torchcodec, flash_attn | step 3, training |
+| `.venv-psi` (uv, py3.10) | psi, torch 2.7.0+**cu128**, torchcodec, flash_attn | step 3, training |
 
 Nothing in steps 1–2 imports `psi`; step 3 imports no sim. **The npz corpus on disk is the
 boundary.** Never try to merge the two envs.
@@ -39,6 +39,59 @@ boundary.** Never try to merge the two envs.
 `.venv-psi` build trap: `uv sync --active` reads `--active` from `$VIRTUAL_ENV`, so running it
 without sourcing `.venv-psi/bin/activate` first silently installs 6.9 GB into the project default
 `.venv`. Use `UV_PROJECT_ENVIRONMENT="$PWD/.venv-psi"` instead.
+
+### Bringing up a new machine
+
+Four traps, all hit for real on 2026-08-15 while standing this up from scratch. None are in either
+README except the first, and each one costs a run.
+
+**1. `uv pip install torch==2.7.0` is a NO-OP against a different CUDA variant.** uv matches on the
+version string, so a `+cu126` build already present satisfies a request that resolves to `+cu128`,
+and only the *other* packages get swapped. Force it:
+
+```bash
+uv pip install --reinstall-package torch --reinstall-package torchvision \
+    torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 \
+    --index-url https://download.pytorch.org/whl/cu128
+```
+
+cu128 is required on **Blackwell (sm_120: RTX 5090, RTX 6000 Pro)** — README troubleshooting #5.
+The symptom is a startup warning listing `sm_50 … sm_90` followed by `CUDA error: no kernel image
+is available for execution on the device` at the first `.to(device)`, which in `sonic.py` is the
+`loss_w` tensor, long before any real work. Rebuild `flash_attn` afterwards.
+
+**2. torchcodec needs FFmpeg *shared libraries* on the loader path.** It `dlopen`s
+`libavutil.so.5{6,7,8,9}` by soname (FFmpeg 4–7; Ubuntu 24.04's 6.1.1 gives so.58). The failure
+mode is nasty: not an import error at startup but a **DataLoader worker crash on the first batch**,
+after the 4 GB VLM has already loaded — `RuntimeError: Could not load libtorchcodec`. Notes:
+
+- `pip`/`uv` cannot supply these. `imageio-ffmpeg` ships a static *binary*, no `.so`; PyAV bundles
+  hash-mangled sonames (`libavutil-b5680d75.so.60`) that `dlopen` will never match, and so.60 is
+  FFmpeg 8 — outside torchcodec's supported range anyway.
+- With sudo: `apt-get install ffmpeg`. Without: `conda create -y -n ffmpeg6 -c conda-forge
+  'ffmpeg=6.1'` and put its `lib/` on `LD_LIBRARY_PATH`. Borrowing C shared objects from a conda
+  env does **not** cross the two-environment boundary — no conda Python is imported.
+- If you go the `LD_LIBRARY_PATH` route it must be exported **in the shell, before the process
+  starts**. Putting it in `.env` does nothing: glibc caches the search path at startup, and
+  `load_dotenv()` runs long after that.
+- Do **not** work around this by switching LeRobot's `video_backend` to pyav. torchcodec was
+  measured byte-identical to imageio-ffmpeg on this corpus (max diff 0); pyav was not.
+
+**3. The HF dataset pull gets rate-limited, and lies about it.** The packed dataset is **7,649
+files**, and Xet requests a token *per file*, which blows the 1000-requests-per-5-minutes quota and
+429s. Worse, a rate-limited `snapshot_download` **exits 0** and silently returns the partial local
+dir. Never trust the exit code — count what landed:
+
+```bash
+HF_HUB_DISABLE_XET=1 hf download sarveshv219/vibe-repose-sim --repo-type=dataset \
+    --local-dir "$HF_LEROBOT_HOME" --max-workers 4
+find "$HF_LEROBOT_HOME"/vibe_repose_g1     -name '*.parquet' | wc -l   # expect 3246
+find "$HF_LEROBOT_HOME"/vibe_repose_g1_val -name '*.parquet' | wc -l   # expect 573
+```
+
+**4. `pypi.nvidia.com` times out** pulling torch's ~3 GB of bundled CUDA libs (cudnn alone is
+693 MB). `UV_HTTP_TIMEOUT=600 UV_CONCURRENT_DOWNLOADS=2` fixes it; uv banks successful wheels, so
+repeating the same command makes progress rather than restarting.
 
 ## The corpus pipeline
 
@@ -70,10 +123,13 @@ measurement behind the design choices and this file does not repeat them.
 | `sarveshv219/vibe-repose-sim-raw` | the npz corpus, 6.9 GB | only to re-run step 3 with different packing |
 
 ```bash
-export $(grep -v '^#' .env | xargs)          # HF_TOKEN, HF_LEROBOT_HOME, HF_HOME
-hf download sarveshv219/vibe-repose-sim --repo-type=dataset \
-    --local-dir "$HF_LEROBOT_HOME"
+set -a; source .env; set +a                  # HF_TOKEN, HF_LEROBOT_HOME, HF_HOME
+HF_HUB_DISABLE_XET=1 hf download sarveshv219/vibe-repose-sim --repo-type=dataset \
+    --local-dir "$HF_LEROBOT_HOME" --max-workers 4
 ```
+
+`HF_HUB_DISABLE_XET=1` and the worker cap are load-bearing, and the exit code is not trustworthy —
+see trap 3 above for why, and for the file counts to verify against.
 
 `HF_LEROBOT_HOME` must point at the download target — LeRobot resolves `repo_id` relative to it,
 so the two dataset dirs have to land as `$HF_LEROBOT_HOME/vibe_repose_g1{,_val}`. Both repos are
@@ -109,10 +165,14 @@ is a single token. That is what makes the `drop_lang` ablation a clean intervent
 ## Training
 
 ```bash
-./scripts/train/psi0/finetune-vibe-repose-psi0.sh <exp>      # BATCH=, SCRATCH=, DRYRUN= env vars
+./scripts/train/psi0/finetune-vibe-repose-psi0.sh <exp> [OVR...]   # BATCH=, SCRATCH=, DRYRUN=
 ```
 
 `DRYRUN=1` prints the resolved flag list without launching — use it to inspect config changes.
+Trailing `OVR` args are appended *after* the resolved flags and win (tyro is last-wins), which is
+how the smoke run overrides step counts without a second script. `SCRATCH=1` swaps the pretrained
+action header for a random one — the control arm for whether a header post-trained on
+Humanoid-Everyday *joint* actions transfers to a *latent* action space, which nobody has tested.
 
 ### Four config traps (all already handled in that script; do not undo them)
 
@@ -183,6 +243,12 @@ silently, which for a mask degrades to "no masking" with no error.
 The frozen VLM stores **no activations**: its params are `requires_grad=False` and its inputs are
 non-differentiable, so `hidden_states[-1]` returns without a graph. That is why this is affordable.
 
+**Throughput, measured once:** 20 steps at batch 16 on an RTX 5090 took **67 s wall including one
+validation pass ≈ 3.3 s/step**. Extrapolated, 40k steps is **~37 h**, which does **not** fit
+`carc.sh`'s `DEF_HOURS=24`. Treat that as an order-of-magnitude figure from a single short run, not
+a benchmark — re-measure on the target card, then pick `-t` (or cut steps, or wire resume) *before*
+submitting, rather than discovering it at hour 24.
+
 **`inference()` re-runs the whole 2.1B VLM at every denoising step** even though `views` is
 constant across the loop. Eval is therefore ~N× more expensive than necessary. Hoisting `views`
 out would need a signature change to `Psi0Model.forward`; not done.
@@ -195,8 +261,81 @@ train/val split disjointness; VRAM. The 2 zero-grad tensors are `transformer_blo
 — the last block sets `context_pre_only=True` and discards its context stream. Benign; zero-grad
 is fine for DDP, only `None`-grad breaks it.
 
-**Never verified:** a complete `optimizer.step()`; `evaluate()` against the real model; multi-GPU
-collectives. All three need a card bigger than 8 GB. **Submit a 20-step job before a long one.**
+**Verified 2026-08-15 by a 20-step smoke run** on an RTX 5090 (32 GB), batch 16, validation at
+step 10. This closed the three items that had never executed anywhere:
+
+| previously unverified | result |
+|---|---|
+| a complete `optimizer.step()` | 20/20 steps, `Happy Ending!` |
+| `evaluate()` against the real model | emitted all three ablations |
+| checkpointing | `ckpt_20` written — the final save fires at max steps even with `checkpointing_steps=100000` |
+
+Reproduce it with (the launcher appends trailing args after the resolved flags, tyro last-wins):
+
+```bash
+./scripts/train/psi0/finetune-vibe-repose-psi0.sh smoke20 \
+    --train.max_training_steps=20 --train.validation_steps=10 \
+    --train.val_num_batches=2 --train.checkpointing_steps=100000
+```
+
+Its numbers are a **pipeline receipt, not a result** — at step 20 the lr is still 2e-6 in warmup
+and 7 tensors were reinitialized minutes earlier:
+
+```
+eval/val_l1_masked 0.841   eval/vs_zoh 6.62   eval/drop_lang +0.0035   eval/drop_vision +0.0057
+```
+
+`vs_zoh` above 1 means worse than persistence — expected at init, and it is the number that decides
+this project. `drop_lang` at 0.4% of val L1 is indistinguishable from zero: right sign, no evidence.
+That `val_l1_masked` exists at all is the useful signal — it confirms `action_is_pad` survived the
+repack → field → transform → collator allowlist.
+
+**Still never verified: multi-GPU collectives.** That is the first thing a multi-GPU run exercises,
+and DDP raises only on `None` grads, which local runs already rule out.
+**Submit a 20-step job before a long one.**
+
+## Porting to CARC (USC Discovery)
+
+`scripts/train/psi0/carc.sh` is the SLURM launcher — **one run per GPU**, never one run sharded
+across GPUs, because the static footprint is ~13 GB and activations are only ~0.04 GB/sample.
+
+```bash
+bash carc.sh setup                     # login node, once: uv venv + deps + checkpoints
+bash carc.sh smoke -g l40s             # 20 steps. DO THIS FIRST on any new cluster
+bash carc.sh submit -g l40s -t 48 -- <exp> [OVR...]
+bash carc.sh sweep  -g l40s --manifest runs.tsv    # job array, 1 GPU per element
+```
+
+### Modules
+
+Determined from what the venv actually links against; resolve exact names with `module spider`,
+and `module purge` first so nothing is inherited from the login shell.
+
+| when | module | why |
+|---|---|---|
+| **every job** | `ffmpeg` | torchcodec, see trap 2 above. Must load *inside* the allocation — it belongs in `setup_run_env()`, not just at submit time |
+| setup only | CUDA toolkit (`nvcc`) + `gcc` | **flash-attn compiles from source** — PyPI ships only an sdist, and the installed wheel here is tagged `cp310-cp310-linux_x86_64`, not manylinux. Expect a long build; cap it with `MAX_JOBS=4` or it OOMs, and run it in an interactive job, not on a login node |
+| setup only | `git` / `git-lfs` | the clone (`GIT_LFS_SKIP_SMUDGE=1` is already in `mode_setup`) |
+
+**Do not load:** a `python` module — uv downloads its own standalone CPython 3.10 and a system one
+only confuses the resolution. **Do not load** a CUDA *runtime*, `cudnn`, or `nccl` module either:
+torch bundles all of them under `site-packages/nvidia/`, and a version-mismatched module is
+actively harmful. Only the GPU node's driver matters, and that is always present.
+
+If Discovery has no `ffmpeg` module, the conda-forge fallback from trap 2 works there too (no sudo
+needed on a cluster either), with `LD_LIBRARY_PATH` exported in `setup_run_env()`.
+
+### `.env` is machine-specific
+
+The local `.env` hardcodes `/home/sarvesh/gyms/Psi0/...` into `HF_LEROBOT_HOME` and `DATA_HOME`;
+**write a fresh one on CARC rather than copying it.** `carc.sh` exports `PSI_HOME` and `HF_HOME`
+itself before Python starts and `load_dotenv()` does not override already-set vars, so those two
+survive — but the rest would silently point at paths that do not exist.
+
+Also note `WANDB_PROJECT`: `WandbConfig.project` is a **CLI flag that defaults to the literal
+`"psi"`**, and reads no env var (only `WANDB_ENTITY` is read from the environment, in
+`config.py:29`). Exporting `WANDB_PROJECT` alone sends every run to a project called `psi`. Both
+launchers now pass `--wandb.project` explicitly; keep it that way.
 
 ## Gotchas
 
@@ -211,8 +350,18 @@ collectives. All three need a card bigger than 8 GB. **Submit a 20-step job befo
   grid is `[1, 16, 20]` → exactly **80 image tokens**, 100 total with the prompt.
 - `--data.transform.model.resize.size 240 320` with an equal `center_crop` **squashes**, it does
   not crop: `v2.Resize` with a 2-tuple scales axes independently. Full 69.3° H-FOV is retained.
-- `train.py` runs `git add . && git commit && git tag <run>` on rank zero at startup.
+- `train.py` runs `git add . && git commit && git tag <run>` on rank zero at startup **only when
+  `--auto-tag-run` is passed** (`train.py:81`, `auto_tag_run` defaults to `False` in
+  `config.py:149`). Neither vibe-repose launcher passes it, so this does not fire by default —
+  but if you ever turn it on, note it is a bare `git add .`, so anything untracked in the repo
+  gets swept in. `PSI_HOME` locally sits *inside* the repo and is only saved by `psi_home/cache/`
+  matching an ignore rule; on CARC it is `$ROOT/psi_home`, outside the tree.
 - `WANDB_API_KEY` in `.env` must be set — the launch script passes `--log.report_to=wandb`.
+  `--wandb.project` must be passed explicitly too; see the CARC section for why.
+- **`.runs/<train.name>/<exp>...` holds the real log**, at
+  `wandb/run-*/files/output.log`, plus `wandb-summary.json` with the final metrics. When a run
+  dies under `torchrun`, the console shows only `ChildFailedError` with no cause — the actual
+  traceback is in that `output.log`. Look there first.
 - The vibe workspace (`../vibe`, `../songen`) is **not a git repo** and exists only on this
   machine. `collect_rollouts.py` and `extract_latents.py` import it, so steps 1–2 **cannot be
   re-run anywhere else**. The `-raw` HF repo above is the only copy of their output — treat it as
