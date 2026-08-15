@@ -41,7 +41,7 @@ VENV=$PSI/.venv-psi
 SELF=$PSI/scripts/train/psi0/carc.sh
 export PSI_HOME=${PSI_HOME:-$ROOT/psi_home}
 
-WANDB_PROJECT=${WANDB_PROJECT:-psi0-repose}
+WANDB_PROJECT=${WANDB_PROJECT:-psi0-vibe-repose}
 WANDB_ENTITY=${WANDB_ENTITY:-vbp}
 
 # Psi0 is dataloader-hungry where vibe is not: every sample decodes one h264 frame
@@ -217,6 +217,7 @@ run_one() {  # run_one <gpu_idx> <exp> [ovr...]
         --train.lr_scheduler_kwargs.weight_decay=1e-6 \
         --train.lr_scheduler_kwargs.betas 0.95 0.999 \
         --log.report_to=wandb \
+        --wandb.project="$WANDB_PROJECT" \
         --data.root_dir=data/lerobot \
         --data.train_repo_ids=vibe_repose_g1 \
         --data.val_repo_ids=vibe_repose_g1_val \

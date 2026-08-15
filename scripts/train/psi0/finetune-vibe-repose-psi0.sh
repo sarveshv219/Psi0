@@ -12,9 +12,14 @@
 #   (c) our state is 32 = joint_pos(29) + projected gravity(3), not 43
 #   (d) the label IS a colour, which rules out hue augmentation
 #
-# Usage:  ./scripts/train/psi0/finetune-vibe-repose-psi0.sh [exp-name]
+# Usage:  ./scripts/train/psi0/finetune-vibe-repose-psi0.sh [exp-name] [OVR...]
 #         BATCH=4 ./scripts/train/psi0/finetune-vibe-repose-psi0.sh smoke      # single small GPU
 #         SCRATCH=1 ./scripts/train/psi0/finetune-vibe-repose-psi0.sh scratch  # control arm
+#         Trailing OVR args are appended after the resolved flags, tyro-style, last wins -- mirrors
+#         carc.sh's smoke mode:
+#           ./scripts/train/psi0/finetune-vibe-repose-psi0.sh smoke20 \
+#               --train.max_training_steps=20 --train.validation_steps=10 \
+#               --train.val_num_batches=2 --train.checkpointing_steps=100000
 
 set -euo pipefail
 cd "$(dirname "$0")/../../.."
@@ -28,6 +33,7 @@ NPROC_PER_NODE=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
 ulimit -n 65535
 
 exp=${1:-vibe-repose}
+[ $# -gt 0 ] && shift
 CKPT_ROOT=${PSI_HOME:-/mnt/ssd500/psi_home}/cache/checkpoints/psi0
 VLM=$CKPT_ROOT/pre.fast.1by1.2601091803.ckpt.ego200k.he30k
 HEADER=$CKPT_ROOT/postpre.1by1.pad36.2601131206.ckpt.he30k
@@ -67,6 +73,7 @@ finetune_real_psi0_config \
 --train.lr_scheduler_kwargs.weight_decay=1e-6 \
 --train.lr_scheduler_kwargs.betas 0.95 0.999 \
 --log.report_to=wandb \
+--wandb.project=${WANDB_PROJECT:-psi0-vibe-repose} \
 --data.root_dir=data/lerobot \
 --data.train_repo_ids=vibe_repose_g1 \
 --data.val_repo_ids=vibe_repose_g1_val \
@@ -140,9 +147,9 @@ except OSError: sys.exit(1)" 2>/dev/null; do
 }
 
 if [ "${DRYRUN:-0}" = "1" ]; then
-    echo "$args"
+    echo "$args" "$@"
     exit 0
 fi
 
 torchrun --nproc_per_node="$NPROC_PER_NODE" --master_port="$(find_free_port 29500)" \
-    scripts/train.py ${args}
+    scripts/train.py ${args} "$@"
