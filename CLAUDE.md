@@ -110,6 +110,30 @@ of `sys.modules`, the only lerobot modules that import it are `visualize_dataset
 `record`, and `visualization_utils`, and `psi` imports exactly one lerobot module
 (`datasets.lerobot_dataset`). It would break `lerobot`'s own visualization CLIs, which we never run.
 
+**6. flash-attn installs a wheel built for a NEWER glibc, and no resolver catches it.** Its
+`setup.py` prefers a prebuilt wheel from GitHub releases over compiling, and those are linked
+against ~glibc 2.35. Install succeeds; the failure is at import, inside model init:
+
+```
+ImportError: /lib64/libc.so.6: version `GLIBC_2.32' not found
+             (required by .../flash_attn_2_cuda.cpython-310-x86_64-linux-gnu.so)
+```
+
+Proof it was never compiled on the cluster: you cannot produce a `GLIBC_2.32` requirement by
+building on glibc 2.28. The wheel tag `cp310-cp310-linux_x86_64` looks locally-built but isn't.
+
+**flash-attn is optional in this fork.** `sonic.py`'s `_attn_implementation()` tries a real import
+and returns `sdpa` when it fails, and `mode_setup` **uninstalls** a present-but-unimportable
+flash_attn. That uninstall is load-bearing: `transformers.is_flash_attn_2_available()` tests
+package *metadata*, not importability, so a broken-but-installed flash_attn makes it return `True`
+and every guard built on it — including `psi0.py:1533`'s — fails open.
+
+The cost is ~nothing. The VLM is frozen at **100 tokens** (80 image + prompt), far below where
+flash-attn's tiling pays, and it is the only module that requests a backend; the action expert
+uses diffusers' attention processors. To insist anyway: `FLASH_ATTENTION_FORCE_BUILD=TRUE
+MAX_JOBS=4 uv pip install flash_attn==2.7.4.post1 --no-build-isolation`, in an allocation, with
+`nvcc` and `gcc` loaded. Or set `PSI0_SKIP_FLASH_ATTN=1` to skip the attempt entirely.
+
 **Not a trap:** `warning: transformers==4.57.0 is yanked`. The pin is upstream's, uv installs it
 anyway, and it is the version everything here was verified against. Leave it.
 
@@ -354,7 +378,7 @@ and `module purge` first so nothing is inherited from the login shell.
 | when | module | why |
 |---|---|---|
 | **every job** | `ffmpeg` | torchcodec, see trap 2 above. Loaded *inside* the allocation by `setup_run_env()`; `module purge` runs first so a login shell's modules are not inherited |
-| setup only | CUDA toolkit (`nvcc`) + `gcc` | **flash-attn compiles from source** — PyPI ships only an sdist, and the installed wheel here is tagged `cp310-cp310-linux_x86_64`, not manylinux. Expect a long build; cap it with `MAX_JOBS=4` or it OOMs, and run it in an interactive job, not on a login node |
+| setup only | CUDA toolkit (`nvcc`) + `gcc` | only if you force a flash-attn source build — see trap 6. The default path needs neither |
 | setup only | `git` / `git-lfs` | the clone (`GIT_LFS_SKIP_SMUDGE=1` is already in `mode_setup`) |
 
 **Do not load:** a `python` module — uv downloads its own standalone CPython 3.10 and a system one

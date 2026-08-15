@@ -30,6 +30,27 @@ from psi.utils.utils import batch_str_to_tensor
 
 overwatch = initialize_overwatch(__name__)
 
+
+def _attn_implementation() -> str:
+    """flash_attention_2 if it actually imports, else sdpa.
+
+    `transformers.is_flash_attn_2_available()` is not usable for this: it tests package
+    METADATA, so on a cluster with an incompatible prebuilt wheel it returns True while
+    `import flash_attn` raises `ImportError: /lib64/libc.so.6: version GLIBC_2.32 not found`.
+    Only a real import distinguishes the two.
+
+    Falling back costs ~nothing here. The VLM is frozen and its sequence is 100 tokens
+    (80 image + prompt), which is nowhere near the regime where flash-attn's tiling wins;
+    it is also the only module that asks for the backend at all -- the action expert goes
+    through diffusers' own attention processors.
+    """
+    try:
+        import flash_attn  # noqa: F401
+    except Exception as e:
+        overwatch.warning(f"flash_attn unusable ({type(e).__name__}: {e}); using sdpa.")
+        return "sdpa"
+    return "flash_attention_2"
+
 # from .base import Trainer
 from .trainer import Trainer, worker_init_fn
 
@@ -98,7 +119,7 @@ class SonicTrainer(Trainer):
     def init_qwen3vl_models(self):
         vlm_model = Qwen3VLForConditionalGeneration.from_pretrained(
             self.model_cfg.model_name_or_path,
-            attn_implementation="flash_attention_2",
+            attn_implementation=_attn_implementation(),
             dtype=torch.bfloat16
         )
         overwatch.info(f"Load pretrained VLM model from {self.model_cfg.model_name_or_path}")

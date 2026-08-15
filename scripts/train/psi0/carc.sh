@@ -134,16 +134,32 @@ mode_setup() {
         --group serve --group viz --group psi --index-strategy unsafe-best-match \
         --no-install-package rerun-sdk
 
-    # flash-attn has no manylinux wheel for this interpreter: PyPI serves an sdist and it
-    # COMPILES, for tens of minutes, against nvcc. MAX_JOBS is not tuning -- unbounded nvcc
-    # parallelism OOMs the build, and on a login node it will get your session killed.
-    if [[ -z ${SLURM_JOB_ID:-} ]]; then
-        echo "[warn] not in an allocation. flash-attn compiles from source here."
-        echo "[warn] prefer: salloc -c 8 --mem 32G -t 2:00:00, then re-run setup."
+    # flash-attn is OPTIONAL here and the install is best-effort. Its setup.py prefers a
+    # prebuilt wheel from GitHub releases over compiling, and those are linked against a newer
+    # glibc than an RHEL-8 cluster has -- the result imports on the build host and dies here
+    # with "GLIBC_2.32 not found", from a DataLoader-free code path that no resolver can catch.
+    #
+    # So: install, then VERIFY BY IMPORTING, and remove it if it is a lie. Removal matters
+    # beyond tidiness -- transformers' is_flash_attn_2_available() tests package metadata, not
+    # importability, so a broken-but-present flash_attn makes every such guard return True.
+    # sonic.py falls back to sdpa on its own; at 100 VLM tokens the difference is noise.
+    #
+    # To insist on flash-attn, force a real compile (tens of minutes, needs nvcc + gcc, and
+    # MAX_JOBS is not tuning -- unbounded nvcc parallelism OOMs the build):
+    #     salloc -c 8 --mem 32G -t 2:00:00
+    #     FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=4 uv pip install \
+    #         flash_attn==2.7.4.post1 --no-build-isolation
+    if [[ ${PSI0_SKIP_FLASH_ATTN:-0} != 1 ]]; then
+        MAX_JOBS=${MAX_JOBS:-4} VIRTUAL_ENV="$VENV" \
+            uv pip install flash_attn==2.7.4.post1 --no-build-isolation || true
+        if "$VENV/bin/python" -c "import flash_attn" 2>/dev/null; then
+            echo "[setup] flash_attn OK"
+        else
+            echo "[setup] flash_attn present but not importable here — removing it so"
+            echo "        is_flash_attn_2_available() reports False. Training uses sdpa."
+            VIRTUAL_ENV="$VENV" uv pip uninstall flash_attn >/dev/null 2>&1 || true
+        fi
     fi
-    command -v nvcc >/dev/null || echo "[warn] no nvcc on PATH — module load cuda before this"
-    MAX_JOBS=${MAX_JOBS:-4} VIRTUAL_ENV="$VENV" \
-        uv pip install flash_attn==2.7.4.post1 --no-build-isolation
 
     # The local .env hardcodes /home/sarvesh paths; copying it points DATA_HOME and
     # HF_LEROBOT_HOME at directories that do not exist here. Write a fresh one.
@@ -176,7 +192,7 @@ EOF
     # and raises "Could not load libtorchcodec". Training never hits it in the main process --
     # only a DataLoader worker does -- so import it HERE, under the same loader path a job gets.
     setup_ffmpeg || exit 1
-    "$VENV/bin/python" -c "import psi, torch, torchcodec, flash_attn; print('[setup] imports OK', torch.__version__)"
+    "$VENV/bin/python" -c "import psi, torch, torchcodec; print('[setup] imports OK', torch.__version__)"
 
     mkdir -p "$PSI/logs/slurm/manifests"
     if [[ -d $PSI/data/lerobot/vibe_repose_g1 ]]; then
