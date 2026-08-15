@@ -60,3 +60,9 @@ unitree_sdk2_python
 
 src/h_rdt/datasets/pretrain/egodex_large_values.txt
 .claude/
+# Policy checkpoints pulled by collect_rollouts.py --wandb-run-path. Binary, 64 MB each, and
+# reproducible from the W&B run id recorded in each corpus's summary.json.
+logs/
+# Corpora written by scripts/data/vibe/. data/ is already ignored above; these are the sizes
+# involved, so that stays true: data/vibe_g1 is 6.9 GB and data/lerobot/* is 3.2 GB.
+.runs/

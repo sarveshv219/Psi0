@@ -290,7 +290,19 @@ def parse_args():
                          "are mislabeled for a command-following task; see the module docstring. "
                          "Exists to measure the cost of the filter, not to train on.")
     ap.add_argument("--overwrite", action="store_true", help="delete --out first")
+    ap.add_argument("--push", metavar="REPO_ID", default=None,
+                    help="after packing, upload both splits to the Hugging Face dataset repo "
+                         "REPO_ID (train) and REPO_ID_val. ~3.2 GB total -- too large for GitHub, "
+                         "whose hard cap is 100 MB per file. Needs HF_TOKEN in .env.")
+    ap.add_argument("--private", action="store_true", help="with --push, create private repos")
     return ap.parse_args()
+
+
+def push_to_hub(local: Path, repo_id: str, private: bool) -> None:
+    from huggingface_hub import create_repo, upload_large_folder
+    create_repo(repo_id, repo_type="dataset", private=private, exist_ok=True)
+    print(f"[push] {local} -> https://huggingface.co/datasets/{repo_id}")
+    upload_large_folder(repo_id=repo_id, repo_type="dataset", folder_path=str(local))
 
 
 def main():
@@ -499,6 +511,11 @@ def main():
     print(f"               --model.action-dim={action_dim} --model.odim={odim} "
           f"--model.action-chunk-size={int(fps)}")
     print(f"               --data.transform.field.stat-path=meta/stats_psi0.json")
+
+    if args.push:
+        push_to_hub(out, args.push, args.private)
+        if val_eps:
+            push_to_hub(out_val, f"{args.push}_val", args.private)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,63 @@
+Psi0
+Copyright 2026 PSI-lab, USC
+
+Licensed under the Apache License, Version 2.0 (the "License"); see LICENSE.
+
+--------------------------------------------------------------------------------
+MODIFICATIONS
+--------------------------------------------------------------------------------
+
+This fork adapts Psi0's action expert to predict 64-d pre-FSQ SONIC motion latents for a
+Unitree G1 cube-repose task simulated in `vibe`, rather than joint/hand actions. Per
+Apache-2.0 section 4(b), the changes to the original work are:
+
+ADDED (no upstream equivalent)
+
+  scripts/data/vibe/                       Corpus pipeline: rollout collection in the vibe sim,
+                                           frozen-SONIC-encoder latent extraction, LeRobot
+                                           packing, and two diagnostic probes. See its README.
+  scripts/train/psi0/finetune-vibe-repose-psi0.sh
+                                           Fine-tune launch config for this task.
+  NOTICE                                   This file.
+
+MODIFIED
+
+  src/psi/config/augmentation.py
+      `ResizeImage` now interpolates with BILINEAR instead of NEAREST. On a task where the
+      commanded colour IS the label, point-sampling a downscale drops thin or oblique coloured
+      faces: a linear colour-visibility probe over Qwen3-VL image tokens scored yellow at
+      AUC 0.908 under NEAREST and 0.965 under BILINEAR at the same 320x240 / 80 tokens.
+
+  src/psi/config/transform.py
+      `RealRepackTransform` and `SimpleRepackTransform` now emit `action_is_pad`, and
+      `Psi0ModelTransform` forwards it. This is the TEMPORAL mask (chunk steps that ran past the
+      end of an episode and were filled by clamping the index), distinct from `actions_mask`,
+      which is a dimension mask. Upstream never consulted it. Used by evaluation only; the
+      training loss is unchanged.
+
+  src/psi/trainers/qwen3vl_mixin.py
+      `PaddedCollatorForTogether` forwards `action_is_pad`. The collator copies an explicit
+      allowlist of keys, so an unlisted key is dropped silently.
+
+  src/psi/trainers/sonic.py
+      1. The pretrained-action-header load now selects tensors by SHAPE compatibility rather
+         than by a `transformer_blocks` name prefix. On the released
+         `postpre.1by1.pad36.2601131206.ckpt.he30k` header this loads 497.5M of 497.7M params
+         (99.93%, 174/181 tensors) instead of 479.2M, recovering `obs_proj.views_proj`,
+         `obs_proj.enc_pos.pe`, `time_ins_embed.*` and `action_proj_out.adaLN_modulation` --
+         none of which depend on the action space, since the expert's width is unchanged. Only
+         7 tensors genuinely must be reinitialized. The change is a strict superset of the
+         previous behaviour and cannot load a mismatched tensor by construction.
+      2. `evaluate()` masks out padded chunk steps (previously hardcoded to ones with a FIXME),
+         and reports three diagnostics: `vs_zoh` (error relative to a zero-order hold on the
+         current latent), `drop_lang` and `drop_vision` (error penalty when the language or
+         image input is permuted across the batch, destroying its correspondence while leaving
+         its marginal distribution exactly unchanged). Enabled by default; set
+         PSI_EVAL_ABLATIONS=0 to skip. Also suppresses the empty `hand_joints` metric bucket
+         when action_dim <= 64.
+
+Upstream: https://github.com/physical-superintelligence-lab/Psi0
+
+The pretrained checkpoints this fork builds on are NOT redistributed here. They are published by
+USC-PSI-Lab at https://huggingface.co/USC-PSI-Lab/psi-model and are fetched by
+scripts/data/download.py; see scripts/data/vibe/README.md.
