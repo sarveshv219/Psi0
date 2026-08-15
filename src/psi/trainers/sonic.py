@@ -48,6 +48,12 @@ class SonicTrainer(Trainer):
         self.ac_dim = self.model_cfg.action_dim
         self.maxmin = self.data_cfg.transform.field
 
+        # `vs_zoh` / `drop_lang` / `drop_vision` at each validation. Two extra full denoising passes
+        # per val batch, so it roughly triples eval cost -- cheap at the default
+        # validation_steps=1000, and it is the only thing that distinguishes a model that solved the
+        # task from one that learned to ignore the instruction. Set PSI_EVAL_ABLATIONS=0 to skip.
+        self.eval_ablations = os.environ.get("PSI_EVAL_ABLATIONS", "1") != "0"
+
         if self.model_cfg.action_dim == 7:
             w_xyz, w_rpy, w_gripper = self.model_cfg.loss_w
             self.loss_w = (
@@ -122,14 +128,39 @@ class SonicTrainer(Trainer):
             if (state_dict["action_proj_in.dec_pos"].shape[0] != self.model_cfg.action_chunk_size or
                 state_dict["action_proj_out.linear.weight"].shape[0] != self.model_cfg.action_dim
             ):
-                # only load transformer blocks when action dimension does not match
-                reduced_state_dict = {}
-                for k, v in state_dict.items():
-                    if k.startswith("transformer_blocks"):
-                        reduced_state_dict[k] = v
+                # Load every tensor whose shape still fits, not just `transformer_blocks`.
+                #
+                # Only four tensors actually depend on the dims that changed: `action_proj_in.ac_proj`
+                # and `action_proj_out.linear` (action_dim), `action_proj_in.dec_pos`
+                # (action_chunk_size), and `obs_proj._obs_proc.1` (odim). On the released
+                # postpre.*.pad36 header that is ~0.2M of 497.7M params. A `transformer_blocks`
+                # prefix filter additionally discards 18.3M that would have loaded fine:
+                # `obs_proj.views_proj` (1536x2048), `obs_proj.enc_pos.pe` (5000x1536),
+                # `time_ins_embed.*` and `action_proj_out.adaLN_modulation` -- none of which touch
+                # the action space at all, since the expert's internal width is unchanged.
+                #
+                # `views_proj` is the one that matters most: it is the learned map from the VLM's
+                # hidden states into the expert. With `--no-tune-vlm` the backbone is frozen and
+                # those features are all the model gets, so throwing away the projection into them
+                # is the worst single tensor to drop.
+                #
+                # Matching on shape rather than name is strictly a superset of the old behaviour and
+                # cannot load a mismatched tensor by construction.
+                model_sd = self.model.action_header.state_dict()
+                reduced_state_dict = {
+                    k: v for k, v in state_dict.items()
+                    if k in model_sd and model_sd[k].shape == v.shape
+                }
+                skipped = sorted(set(state_dict) - set(reduced_state_dict))
                 overwatch.info(f"Loading pretrained action header from {ckpt_path}")
                 self.model.action_header.load_state_dict(reduced_state_dict, strict=False)
-                overwatch.warning("action header size mismatch, only loaded transformer blocks.")
+                n_load = sum(v.numel() for v in reduced_state_dict.values())
+                n_all = sum(v.numel() for v in state_dict.values())
+                overwatch.warning(
+                    f"action header size mismatch: loaded {len(reduced_state_dict)}/{len(state_dict)} "
+                    f"tensors ({n_load / 1e6:.1f}M/{n_all / 1e6:.1f}M params, "
+                    f"{n_load / max(n_all, 1) * 100:.1f}%); reinitialized {skipped}"
+                )
             else:
                 self.model.action_header.load_state_dict(state_dict, strict=False)
             overwatch.info("loaded pretrained action header successfully.")
@@ -425,6 +456,71 @@ class SonicTrainer(Trainer):
         self.accelerator.save_model(self.model, ckpt_dir)
         return super().save_checkpoint(global_step)
 
+    @staticmethod
+    def _deranged(n: int, device) -> torch.Tensor:
+        """A permutation of 0..n-1 with no fixed point, for the ablation shuffles.
+
+        Shuffling an input across the batch is a better ablation than zeroing or blanking it: the
+        marginal distribution the model sees is EXACTLY unchanged, so any change in error is
+        attributable to the destroyed correspondence rather than to an out-of-distribution input.
+
+        A random rotation rather than a rejection-sampled random derangement: a rotation by
+        k in [1, n-1] is a permutation with no fixed point by construction, which a patched-up
+        `randperm` is not -- repairing a lone fixed point by copying a neighbour's value silently
+        yields a non-permutation, duplicating one sample's command and dropping another's. The
+        rotation is not uniform over derangements, but nothing here needs it to be: the requirement
+        is only that every sample receives some OTHER sample's input.
+        """
+        if n < 2:
+            return torch.arange(n, device=device)
+        k = int(torch.randint(1, n, (1,)).item())
+        return (torch.arange(n, device=device) + k) % n
+
+    def _ablations(self, eval_model, batch, gt_actions, mask, base_pred):
+        """-> {name: summed masked L1} for the baseline, ZOH, and the two input ablations.
+
+        **vs_zoh** compares against persistence: repeat the CURRENT latent across the whole chunk.
+        `delta_timestamps` puts t+0 at chunk index 0, so `gt[:, 0]` is the latent at the present
+        step -- a baseline the deployed system could actually compute, since vibe's own tokenizer
+        produces it live. songen's equivalent sat at 0.89 (model error 89% of persistence error)
+        through six runs, which is what "the target is nearly determined by the present" looks like
+        as a number. Lower is better; near 1.0 means the model is barely beating doing nothing.
+
+        **drop_lang** permutes `input_ids`/`attention_mask` across the batch. Every sample's prompt
+        is byte-identical except the one colour word, so a row permutation is exactly a
+        colour-command swap -- same tokens, same length, same template, only the correspondence to
+        the image and the action is destroyed. A POSITIVE value means the model reads the command.
+        songen's stayed negative, i.e. the command was worse than useless.
+
+        **drop_vision** does the same to `pixel_values`. Qwen packs every image's patches into one
+        flat tensor, so this is only well-defined when all grids are equal; it is skipped otherwise
+        rather than silently scrambling patches across differently-sized images.
+        """
+        out = {}
+        B, Tp, Da = gt_actions.shape
+
+        def masked_l1(pred):
+            return ((pred - gt_actions).abs() * mask).sum()
+
+        out["base"] = masked_l1(base_pred)          # reuse the main pass, don't denoise twice
+        out["zoh"] = masked_l1(gt_actions[:, :1, :].expand(-1, Tp, -1))
+
+        perm = self._deranged(B, gt_actions.device)
+        lang = dict(batch)
+        lang["input_ids"] = batch["input_ids"][perm]
+        lang["attention_mask"] = batch["attention_mask"][perm]
+        out["drop_lang"] = masked_l1(self.inference(eval_model, lang))
+
+        if B > 1:
+            # PaddedCollatorForTogether torch.stack()s per-instance pixel_values, so this is already
+            # batch-major and a row permutation is exactly an image swap.
+            pv = batch["pixel_values"]
+            vis = dict(batch)
+            vis["pixel_values"] = ({k: v[perm] for k, v in pv.items()}
+                                   if isinstance(pv, dict) else pv[perm])
+            out["drop_vision"] = masked_l1(self.inference(eval_model, vis))
+        return out
+
     def evaluate(self) -> dict[str, float] | None:
         accelerator = self.accelerator
         global_step = self.global_step
@@ -446,12 +542,23 @@ class SonicTrainer(Trainer):
 
         val_loss_list = []
         action_l1_err_list = []
+        abl_sums: dict[str, torch.Tensor] = {}
+        abl_count = torch.zeros((), device=self.device)
 
         for val_step, val_batch in enumerate(val_progress_bar):
             val_batch = batch_str_to_tensor(val_batch)
-            # mask = val_batch["mask"]
-            mask = torch.ones_like(val_batch["actions"]) # FIXME
             gt_actions = val_batch["actions"]  # (B, Tp, Da)
+            # Exclude the chunk's padded tail from every reported metric. Past the end of an episode
+            # LeRobot clamps the index, so those steps are an exact copy of the last real latent --
+            # a zero-order hold scores them perfectly and so will the model, which flatters val
+            # error and shrinks the very gaps `vs_zoh` and `drop_lang` exist to measure. On this
+            # corpus that is 10.2% of all steps and it is not spread evenly: it is the last 49 rows
+            # of every episode, i.e. exactly where the cube flip completes.
+            if "action_is_pad" in val_batch:
+                mask = (~val_batch["action_is_pad"].bool()).to(gt_actions.dtype)
+                mask = mask[:, :, None].expand_as(gt_actions)
+            else:
+                mask = torch.ones_like(gt_actions)
             # gt_actions = self.data_cfg.data_transforms.normalize_action(repacked_batch[1])
 
             # Tp -> predicted action horizon, Da -> action dim
@@ -475,6 +582,18 @@ class SonicTrainer(Trainer):
                 ].abs()
                 action_l1_err_list.append(err_action_l1.reshape(-1, Da).float().cpu().numpy())  # (B*world_size*Ta, 7)
 
+                # Diagnostics. Val MAE alone cannot tell a model that solved this task from one that
+                # learned to ignore the command -- a wrong-but-consistent target trains to a
+                # perfectly respectable MAE, which is how songen ran six times before the failure
+                # was visible. These are the numbers that distinguish the two.
+                if self.eval_ablations:
+                    for k, v in self._ablations(eval_model, val_batch, gt_actions, mask,
+                                                pred_actions).items():
+                        g = accelerator.gather(v.detach().reshape(1)).sum()
+                        abl_sums[k] = abl_sums.get(k, torch.zeros((), device=self.device)) + g
+                    abl_count = abl_count + accelerator.gather(
+                        mask.sum().detach().reshape(1)).sum()
+
             if val_step + 1 >= total_val_batches:
                 if accelerator.is_local_main_process:
                     val_progress_bar.close()
@@ -492,21 +611,36 @@ class SonicTrainer(Trainer):
         # action L1 errors
         avg_action_errors_denormed = action_l1_err_list_denormed.mean(0)  # (Da,) NOTE only if the error is L1 (linear)
         
-        # Define dimension splits: hand_joints(14) + arm_joints(14) + rpy(3) + height(1) = 32
-        labels_denormed = [
-            "latent_action",
-            "hand_joints"
-        ]
-    
-        avg_lr_action_err_denormed = np.split(
-            avg_action_errors_denormed, [64,], axis=-1
-        )
+        # SONIC's action is motion_token(64) + hand(14). A hands-free embodiment sets action_dim=64,
+        # which makes the second split empty -- reporting a constant 0.0 "hand_joints" is noise, so
+        # only emit the buckets that exist.
+        splits = np.split(avg_action_errors_denormed, [64], axis=-1)
+        metrics = {"loss": avg_val_loss,
+                   "latent_action": float(np.linalg.norm(splits[0]))}
+        if splits[1].size:
+            metrics["hand_joints"] = float(np.linalg.norm(splits[1]))
 
-        # log metrics
-        return {
-            "loss": avg_val_loss,
-            **dict(zip(labels_denormed, map(np.linalg.norm, avg_lr_action_err_denormed)))
-        }
+        # --- diagnostics ------------------------------------------------------------------ #
+        # All computed on the same masked, unpadded steps as `latent_action`.
+        #
+        #   vs_zoh     model L1 / persistence L1.  <1 is better than doing nothing; songen sat at
+        #              0.89 for six runs. ~1.0 means the target is nearly determined by the present
+        #              and there is little gradient pressure to read anything else.
+        #   drop_lang  (L1 with commands swapped across the batch) / (baseline L1), minus 1.
+        #              POSITIVE = the model uses the command. songen's was negative throughout.
+        #              Diluted by ~1/6, since a swap can land on another sample that happens to
+        #              carry the same colour; the sign and the ordering across runs are unaffected.
+        #   drop_vision  same, for the image.
+        if self.eval_ablations and abl_sums and float(abl_count) > 0:
+            base, zoh = float(abl_sums["base"]), float(abl_sums["zoh"])
+            metrics["val_l1_masked"] = base / float(abl_count)
+            if zoh > 0:
+                metrics["vs_zoh"] = base / zoh
+            if base > 0:
+                for k in ("drop_lang", "drop_vision"):
+                    if k in abl_sums:
+                        metrics[k] = float(abl_sums[k]) / base - 1.0
+        return metrics
 
     def forward_and_loss(self, model, batch) -> dict[str, torch.Tensor]:
         bsz, Tp, Da = batch["actions"].shape

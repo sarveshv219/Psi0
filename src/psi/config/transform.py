@@ -353,7 +353,18 @@ class RealRepackTransform(LerobotRepackTransform):
             "actions": np.array(actions, dtype=np.float32),  # (Tp, Da)
             "instruction": data[self.instruction_key].lower(),
             "actions_mask": mask, #(Tp, Da)
-        } 
+        }
+        # `actions_mask` above is a DIMENSION mask (which action dims are real vs zero-padding to
+        # pad_action_dim); it says nothing about TIME. Near the end of an episode LeRobot clamps the
+        # index, so the tail of the chunk is a verbatim copy of the last real step -- and neither
+        # branch above consults `action_is_pad`, so those copies carry full loss weight.
+        #
+        # That is left alone for training: on a corpus whose episodes end in a settled hold they are
+        # near-truth and teach a sane terminal behaviour. But they are trivially predictable, so
+        # letting them into a VALIDATION metric measures the padding rather than the task. Carried
+        # here so `evaluate()` can exclude them; the loss never sees it.
+        if f"{self.action_key}_is_pad" in data:
+            result["action_is_pad"] = np.asarray(data[f"{self.action_key}_is_pad"], dtype=bool)
         return result
 
 class SimpleRepackTransform(LerobotRepackTransform):
@@ -391,7 +402,14 @@ class SimpleRepackTransform(LerobotRepackTransform):
             "observations": [pt_to_pil(data[image_key],normalized=False)], # single view
             "states": states.astype(np.float32), # (To, Do)
             "actions": actions.astype(np.float32), # (Tp, Da)
-            # "action_is_pad": np.array(data["action_is_pad"], dtype=bool),
+            # Carried SEPARATELY from `actions_mask` on purpose. `actions_mask` is the training loss
+            # weight and, when pad_action_dim is None, is deliberately all-ones so the chunk's padded
+            # tail still contributes -- on a corpus whose episodes end in a settled hold, those
+            # repeats are near-truth and teach a sane terminal behaviour. But they are trivially
+            # predictable (an exact copy of the last real step), so letting them into a VALIDATION
+            # metric flatters the model and compresses the gap against a zero-order-hold baseline.
+            # Eval masks on this key; the loss does not.
+            "action_is_pad": np.asarray(action_is_pad, dtype=bool),   # (Tp,)
             "instruction": data["task"].lower(),
             "actions_mask": mask
         }
@@ -843,6 +861,9 @@ class Psi0ModelTransform(ModelTransform):
         inputs["raw_actions"] = data["raw_actions"]
         if "actions_mask" in data:
             inputs["actions_mask"] = data["actions_mask"]
+
+        if "action_is_pad" in data:
+            inputs["action_is_pad"] = data["action_is_pad"]   # eval-only; see the repack transform
 
         inputs["raw_images"] = images
         inputs['actions'] = data["actions"]

@@ -142,6 +142,15 @@ class PaddedCollatorForTogether:
         if actions_mask is not None:
             output["actions_mask"] = actions_mask
 
+        # (B, Tp) bool. Distinct from `actions_mask`: that one is the training loss weight, this one
+        # marks chunk steps that ran past the end of the episode and were filled by clamping the
+        # index. Eval excludes them so a zero-order hold cannot score free points; the loss keeps
+        # them. This collator forwards an explicit allowlist, so a key absent from it is dropped
+        # silently -- which for a mask means it degrades to "no masking" with no error.
+        action_is_pad = torch.stack([torch.as_tensor(instance["action_is_pad"]) for instance in instances]) if "action_is_pad" in instances[0] else None
+        if action_is_pad is not None:
+            output["action_is_pad"] = action_is_pad
+
         raw_images = torch.stack([torch.from_numpy(np.array(instance["raw_images"])) for instance in instances]) if "raw_images" in instances[0] else None
         if raw_images is not None:
             output["raw_images"] = raw_images

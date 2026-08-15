@@ -12,7 +12,11 @@ class ResizeImage(BaseModel):
             from torchvision.transforms import v2
         except:
             from torchvision import transforms as v2
-        return v2.Resize(self.size, interpolation=v2.InterpolationMode.NEAREST)
+        # BILINEAR, not NEAREST. Point-sampling a downscale drops thin/oblique coloured faces
+        # outright: on the vibe repose corpus a linear colour-visibility probe over Qwen3-VL's
+        # image tokens scored yellow at AUC 0.908 under NEAREST and 0.965 under BILINEAR, at the
+        # same 320x240 / 80 tokens. Averaging is the right kernel when the label IS the colour.
+        return v2.Resize(self.size, interpolation=v2.InterpolationMode.BILINEAR)
 
     @property
     def resolution(self) -> Tuple[int, int]:
