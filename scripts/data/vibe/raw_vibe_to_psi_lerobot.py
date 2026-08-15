@@ -291,8 +291,11 @@ def parse_args():
                          "Exists to measure the cost of the filter, not to train on.")
     ap.add_argument("--overwrite", action="store_true", help="delete --out first")
     ap.add_argument("--push", metavar="REPO_ID", default=None,
-                    help="after packing, upload both splits to the Hugging Face dataset repo "
-                         "REPO_ID (train) and REPO_ID_val. ~3.2 GB total -- too large for GitHub, "
+                    help="after packing, upload the PARENT of --out to the Hugging Face dataset "
+                         "repo REPO_ID, so both splits land under the directory names training "
+                         "resolves against (--data.root_dir + --data.{train,val}_repo_ids) and a "
+                         "download round-trips with no renaming. e.g. "
+                         "--push sarveshv219/vibe-repose-sim. ~3.2 GB -- too large for GitHub, "
                          "whose hard cap is 100 MB per file. Needs HF_TOKEN in .env.")
     ap.add_argument("--private", action="store_true", help="with --push, create private repos")
     return ap.parse_args()
@@ -513,9 +516,12 @@ def main():
     print(f"               --data.transform.field.stat-path=meta/stats_psi0.json")
 
     if args.push:
-        push_to_hub(out, args.push, args.private)
-        if val_eps:
-            push_to_hub(out_val, f"{args.push}_val", args.private)
+        # The PARENT, not each split: `upload-large-folder` writes to the repo root, so
+        # uploading `data/lerobot` reproduces `vibe_repose_g1/` and `vibe_repose_g1_val/`
+        # verbatim on the Hub. Two separate repos would force a rename on download, and the
+        # split names are load-bearing -- `val_repo_ids` defaults to the TRAINING repo, so a
+        # mismatched name silently validates in-sample rather than erroring.
+        push_to_hub(out.parent, args.push, args.private)
 
 
 if __name__ == "__main__":

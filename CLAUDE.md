@@ -60,7 +60,34 @@ measurement behind the design choices and this file does not repeat them.
 | `data/lerobot/vibe_repose_g1_val` | 573 episodes / 140,618 frames (15%, held out by episode) |
 | checkpoints | `$PSI_HOME/cache/checkpoints/psi0/` — VLM 4.0 GB + action header 1.9 GB |
 
-`data/` is gitignored. Datasets belong on the HF Hub (`--push`), never in git.
+`data/` is gitignored. Datasets belong on the HF Hub, never in git.
+
+### Fetching the corpus on a new machine
+
+| HF repo (private) | what | need it for |
+|---|---|---|
+| `sarveshv219/vibe-repose-sim` | the packed LeRobot dataset, ~3.2 GB | **training** — this is all you need |
+| `sarveshv219/vibe-repose-sim-raw` | the npz corpus, 6.9 GB | only to re-run step 3 with different packing |
+
+```bash
+export $(grep -v '^#' .env | xargs)          # HF_TOKEN, HF_LEROBOT_HOME, HF_HOME
+hf download sarveshv219/vibe-repose-sim --repo-type=dataset \
+    --local-dir "$HF_LEROBOT_HOME"
+```
+
+`HF_LEROBOT_HOME` must point at the download target — LeRobot resolves `repo_id` relative to it,
+so the two dataset dirs have to land as `$HF_LEROBOT_HOME/vibe_repose_g1{,_val}`. Both repos are
+**private**; `HF_TOKEN` is required to read them and is in `.env` (gitignored, never committed).
+
+Re-uploading after a repack:
+
+```bash
+hf upload-large-folder sarveshv219/vibe-repose-sim data/lerobot \
+    --repo-type=dataset --private --num-workers 8
+```
+
+`upload-large-folder` is resumable — it keeps per-file hashes in `data/lerobot/.cache/upload/`, so
+a killed run re-runs with the identical command and skips the hashing pass.
 
 ## Column semantics
 
@@ -186,5 +213,7 @@ collectives. All three need a card bigger than 8 GB. **Submit a 20-step job befo
   not crop: `v2.Resize` with a 2-tuple scales axes independently. Full 69.3° H-FOV is retained.
 - `train.py` runs `git add . && git commit && git tag <run>` on rank zero at startup.
 - `WANDB_API_KEY` in `.env` must be set — the launch script passes `--log.report_to=wandb`.
-- The vibe workspace (`../vibe`, `../songen`) is **not a git repo**. `collect_rollouts.py` and
-  `extract_latents.py` cannot run without it, so this repo alone is not reproducible.
+- The vibe workspace (`../vibe`, `../songen`) is **not a git repo** and exists only on this
+  machine. `collect_rollouts.py` and `extract_latents.py` import it, so steps 1–2 **cannot be
+  re-run anywhere else**. The `-raw` HF repo above is the only copy of their output — treat it as
+  the reproducibility boundary, not as a convenience mirror.
