@@ -388,14 +388,13 @@ settings; flash-attn gets `MAX_JOBS=4` and warns outside an allocation. Escape h
 | `HF_DATASET` | override the dataset repo `mode_data` pulls |
 | `PSI0_CUDA_HOME` | toolkit prefix for deepspeed's import scan; skips the `CUDA_MODULES` hunt |
 
-**A ddp-only run still needs an `nvcc` on the node, because of deepspeed.** This one costs ~1000
-steps to discover. `accelerate`'s `extract_model_from_parallel` does `from deepspeed import
+**A ddp-only run still needs an `nvcc` on the node, because of deepspeed.** `accelerate`'s `extract_model_from_parallel` does `from deepspeed import
 DeepSpeedEngine` whenever the package is merely *installed* (`is_deepspeed_available()` is a
 `find_spec` + metadata check, `imports.py:163`) — it only wants the class for an `isinstance`
 tuple. Importing deepspeed 0.17.1 runs an op-compatibility scan at module scope
 (`git_version_info.py:29`), and `fp_quantizer.is_compatible()` calls `installed_cuda_version()`
 **without catching** the `MissingCUDAException` it raises when `torch.utils.cpp_extension.CUDA_HOME`
-is `None`. So training runs perfectly and then dies at the **first `evaluate()`**:
+is `None`. So the model loads, training steps run, and the job dies at the **first `evaluate()`**:
 
 ```
 deepspeed.ops.op_builder.builder.MissingCUDAException: CUDA_HOME does not exist,
@@ -409,9 +408,23 @@ the prefix out of a **subshell** `module load` so the toolkit's `lib64` never re
 loading the module for real is exactly the shadowing this file warns against below. It also sets
 `DS_SKIP_CUDA_CHECK=1`, since only the CUDA *major* has to match torch's and nothing is compiled.
 
-The preflight now imports deepspeed too, so a node without `nvcc` fails in 10 s at startup instead
-of at step 1000. If no toolkit exists at all, `uv pip uninstall deepspeed` is safe on this path —
-`data_parallel=ddp` never constructs a `DeepSpeedEngine`; it only forecloses `zero3_offload.json`.
+The preflight now imports deepspeed too, so a node without `nvcc` fails in 10 s at startup rather
+than after the 4 GB model load. If no toolkit exists at all, `uv pip uninstall deepspeed` is safe
+here — `data_parallel=ddp` never constructs a `DeepSpeedEngine`; it only forecloses
+`zero3_offload.json`.
+
+### Long runs self-smoke in the first two minutes
+
+**`evaluate()` runs at `global_step == 0`** — `train.py:260` ORs that in ahead of the
+`validation_steps` modulus, so the eval path is exercised on the first optimizer step no matter
+what cadence you pass. Everything that only `evaluate()` touches — `unwrap_model`, the val
+dataloader against `vibe_repose_g1_val`, the three ablations, the `action_is_pad` masking — either
+works within ~2 min of the job starting or the job is already dead.
+
+That is why submitting the 48 h sweep directly is reasonable when the queue wait is hours: the
+first `eval/*` row in wandb **is** the smoke test, and it arrives before the queue wait would have
+paid for a separate one. `carc.sh smoke` still buys one thing the full run cannot — it reaches
+`save_checkpoint()` (at its step 20) in a 1 h allocation instead of at step 5000.
 
 **Job arrays share a node, so torchrun must not pick a fixed port.** `--gres=gpu:l40s:1` leaves
 the other cards on a 2–4 GPU node free, and SLURM packs further array elements onto them. Every

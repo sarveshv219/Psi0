@@ -378,8 +378,8 @@ mode_sweep() {
 # MissingCUDAException it raises when torch.utils.cpp_extension.CUDA_HOME is None. accelerate's
 # extract_model_from_parallel imports deepspeed whenever the package is merely INSTALLED -- it
 # only wants DeepSpeedEngine for an isinstance tuple -- so a pure `data_parallel=ddp` run with no
-# nvcc on the node dies at its FIRST evaluate(), i.e. ~1000 steps in, on a node where training
-# itself is perfectly healthy.
+# nvcc on the node dies at its FIRST evaluate() -- which train.py:260 fires at global_step == 0,
+# NOT at validation_steps, so it costs ~2 min of a job, not hours.
 #
 # deepspeed needs exactly one thing: $CUDA_HOME/bin/nvcc to answer -V. So export the variable and
 # NOTHING else. Do not `module load cuda` in this shell: its lib64 lands ahead of torch's bundled
@@ -467,7 +467,7 @@ print(f"[preflight] {name} {cap} OK, torch {torch.__version__}")
 
 # accelerate imports deepspeed inside unwrap_model() whenever the package is merely installed,
 # and deepspeed scans its CUDA op builders at import. Do it HERE so a missing nvcc costs 10
-# seconds at startup instead of surfacing at the first evaluate(), 1000 steps in.
+# seconds at startup instead of after the model load and the step-0 validation.
 from accelerate.utils.imports import is_deepspeed_available
 if is_deepspeed_available():
     try:
