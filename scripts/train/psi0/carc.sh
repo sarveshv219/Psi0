@@ -80,6 +80,26 @@ FFMPEG_MODULES=${FFMPEG_MODULES:-"ffmpeg/7.0 ffmpeg/6.1.1 ffmpeg/6.1 ffmpeg/6.0 
 # is what makes the ffmpeg/* names visible at all.
 FFMPEG_PREREQS=${FFMPEG_PREREQS:-"usc gcc"}
 
+# `module` is a shell FUNCTION from /etc/profile.d, and an sbatch payload runs in a
+# non-interactive, non-login shell. Lmod exports it (BASH_FUNC_module%%) so --export=ALL usually
+# carries it in -- but "usually" is how a sweep dies. Source the init explicitly when it is
+# missing, so the script can load its own modules instead of depending on the caller's shell.
+init_modules() {
+    command -v module >/dev/null 2>&1 && return 0
+    local f
+    for f in "${LMOD_PKG:-/usr/share/lmod/lmod}/init/bash" \
+             /usr/share/lmod/lmod/init/bash \
+             /usr/share/Modules/init/bash \
+             /etc/profile.d/modules.sh \
+             /etc/profile.d/lmod.sh; do
+        # shellcheck disable=SC1090
+        [[ -r $f ]] && { source "$f" 2>/dev/null || true; }
+        command -v module >/dev/null 2>&1 && { echo "[modules] initialized from $f"; return 0; }
+    done
+    echo "[modules] WARN: no module command available" >&2
+    return 1
+}
+
 have_libavutil() {
     local d
     ldconfig -p 2>/dev/null | grep -qE 'libavutil\.so\.5[6-9]' && return 0
@@ -99,11 +119,12 @@ setup_ffmpeg() {
         export PATH="$PSI0_FFMPEG_DIR/bin:$PATH"
         export LD_LIBRARY_PATH="$PSI0_FFMPEG_DIR/lib:${LD_LIBRARY_PATH:-}"
         echo "[ffmpeg] PSI0_FFMPEG_DIR=$PSI0_FFMPEG_DIR"
-    elif command -v module >/dev/null 2>&1; then
+    elif init_modules; then
         local m
         for m in $FFMPEG_PREREQS; do module load "$m" 2>/dev/null || true; done
         for m in $FFMPEG_MODULES; do
-            module load "$m" 2>/dev/null && { echo "[ffmpeg] module $m"; break; }
+            module load "$m" 2>/dev/null && have_libavutil \
+                && { echo "[ffmpeg] module $m"; break; }
         done
     fi
 
