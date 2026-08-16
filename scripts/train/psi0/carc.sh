@@ -424,9 +424,16 @@ run_one() {  # run_one <gpu_idx> <exp> [ovr...]
     local gpu=$1 exp=$2; shift 2
     echo "=== [gpu:$gpu] $exp ${*:+ovr=$*} ==="
     # One process per GPU. torchrun --nproc_per_node=1 (rather than plain python) so the
-    # distributed env vars accelerate expects under data_parallel=ddp are always set; the
-    # port is per-GPU so packed runs on one node cannot collide on rendezvous.
-    CUDA_VISIBLE_DEVICES=$gpu torchrun --nproc_per_node=1 --master_port=$((29500 + gpu)) \
+    # distributed env vars accelerate expects under data_parallel=ddp are always set.
+    #
+    # --standalone, NOT --master_port=$((29500 + gpu)). A per-GPU offset only deconflicts runs
+    # that this shell launched, and every array element calls run_one with gpu=0 -- so as soon
+    # as SLURM packs two array tasks onto one node (which it does: an L40S node has 2-4 cards
+    # and --gres=gpu:1 leaves the rest free) both bind 29500 and all but one die with
+    # `DistNetworkError ... EADDRINUSE`. --standalone sets rdzv-endpoint=localhost:0, so the
+    # kernel assigns a free ephemeral port; the agent still exports MASTER_ADDR/MASTER_PORT to
+    # the worker, which is all accelerate reads.
+    CUDA_VISIBLE_DEVICES=$gpu torchrun --standalone --nproc_per_node=1 \
         scripts/train.py \
         finetune_real_psi0_config \
         --seed=292285 --exp="$exp" \

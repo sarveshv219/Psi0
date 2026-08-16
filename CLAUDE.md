@@ -387,6 +387,22 @@ settings; flash-attn gets `MAX_JOBS=4` and warns outside an allocation. Escape h
 | `PSI0_HF_ONLINE=1` | undo the default `HF_HUB_OFFLINE=1` if a run must reach the hub |
 | `HF_DATASET` | override the dataset repo `mode_data` pulls |
 
+**Job arrays share a node, so torchrun must not pick a fixed port.** `--gres=gpu:l40s:1` leaves
+the other cards on a 2–4 GPU node free, and SLURM packs further array elements onto them. Every
+element is a separate job that runs `run_one 0`, so a per-GPU port offset deconflicts nothing —
+they all compute 29500, and all but the first die at rendezvous:
+
+```
+torch.distributed.DistNetworkError: The server socket has failed to listen on any local
+network address. port: 29500, ... EADDRINUSE
+```
+
+`run_one` therefore passes **`--standalone`** (rdzv-endpoint `localhost:0`, kernel-assigned
+ephemeral port), not `--master_port`. The elastic agent still exports `MASTER_ADDR`/`MASTER_PORT`
+to the worker from the c10d bootstrap store, which is the only thing accelerate reads. Do not
+"fix" this by hashing `SLURM_JOB_ID` into a port — that trades a certain collision for a rare one
+and still loses to a stale process holding the port from a previous job on the same node.
+
 `setup_run_env` also runs one real CUDA kernel before training starts. An arch mismatch otherwise
 surfaces as `no kernel image is available` on `sonic.py`'s `loss_w` tensor, minutes in and with the
 traceback buried inside a `ChildFailedError`.
