@@ -80,6 +80,11 @@ FFMPEG_MODULES=${FFMPEG_MODULES:-"ffmpeg/7.0 ffmpeg/6.1.1 ffmpeg/6.1 ffmpeg/6.0 
 # is what makes the ffmpeg/* names visible at all.
 FFMPEG_PREREQS=${FFMPEG_PREREQS:-"usc gcc"}
 
+# Toolkit modules to hunt for an `nvcc` -- read in a subshell, never loaded into this one. Only
+# the MAJOR has to match torch's (12), so any cuda/12.x works; see setup_cuda_home().
+CUDA_MODULES=${CUDA_MODULES:-"cuda/12.6.3 cuda/12.6 cuda/12.4 cuda/12.2 cuda/12 cuda"}
+[[ -n ${PSI0_CUDA_HOME:-} ]] && export CUDA_HOME=$PSI0_CUDA_HOME
+
 # `module` is a shell FUNCTION from /etc/profile.d, and an sbatch payload runs in a
 # non-interactive, non-login shell. Lmod exports it (BASH_FUNC_module%%) so --export=ALL usually
 # carries it in -- but "usually" is how a sweep dies. Source the init explicitly when it is
@@ -368,6 +373,47 @@ mode_sweep() {
         -- run-array "$BATCH" "$STEPS" "$snap"
 }
 
+# deepspeed 0.17.1 runs an op-compatibility scan at IMPORT time (git_version_info.py:29), and
+# fp_quantizer's is_compatible() calls installed_cuda_version() without catching the
+# MissingCUDAException it raises when torch.utils.cpp_extension.CUDA_HOME is None. accelerate's
+# extract_model_from_parallel imports deepspeed whenever the package is merely INSTALLED -- it
+# only wants DeepSpeedEngine for an isinstance tuple -- so a pure `data_parallel=ddp` run with no
+# nvcc on the node dies at its FIRST evaluate(), i.e. ~1000 steps in, on a node where training
+# itself is perfectly healthy.
+#
+# deepspeed needs exactly one thing: $CUDA_HOME/bin/nvcc to answer -V. So export the variable and
+# NOTHING else. Do not `module load cuda` in this shell: its lib64 lands ahead of torch's bundled
+# CUDA on LD_LIBRARY_PATH, which is searched before the RUNPATH torch resolves its own libs with.
+# Reading the prefix out of a SUBSHELL gets the path without the side effects.
+setup_cuda_home() {
+    local p
+    # Test the variable BEFORE using it as a prefix: unset, "${CUDA_HOME:-}/bin/nvcc" is the
+    # absolute path /bin/nvcc, which on a box with a system toolkit exists -- and then p is set
+    # to the empty string and the real search never runs.
+    if [[ -n ${CUDA_HOME:-} && -x $CUDA_HOME/bin/nvcc ]]; then p=$CUDA_HOME
+    elif [[ -n ${CUDA_PATH:-} && -x $CUDA_PATH/bin/nvcc ]]; then p=$CUDA_PATH
+    elif p=$(command -v nvcc 2>/dev/null) && [[ -n $p ]]; then p=$(dirname "$(dirname "$p")")
+    elif init_modules; then
+        local m
+        for m in $CUDA_MODULES; do
+            # Subshell: the module's PATH/LD_LIBRARY_PATH edits die with it, the string survives.
+            p=$(module load "$m" >/dev/null 2>&1 && command -v nvcc 2>/dev/null) || continue
+            [[ -n $p ]] && { p=$(dirname "$(dirname "$p")"); echo "[cuda_home] module $m"; break; }
+        done
+    fi
+    if [[ -z ${p:-} || ! -x $p/bin/nvcc ]]; then
+        echo "[cuda_home] WARN: no nvcc found. If deepspeed is installed, the first evaluate()" >&2
+        echo "  will raise MissingCUDAException. Fix with PSI0_CUDA_HOME=/path/to/cuda, or drop" >&2
+        echo "  the package (\`uv pip uninstall deepspeed\`) -- ddp never constructs it." >&2
+        return 1
+    fi
+    export CUDA_HOME=$p
+    # is_compatible() only compares CUDA majors, but a builder that calls assert_no_cuda_mismatch
+    # would reject 12.6.3-vs-12.6 on the minor. Nothing is compiled here, so waive it.
+    export DS_SKIP_CUDA_CHECK=1
+    echo "[cuda_home] $CUDA_HOME ($("$p/bin/nvcc" --version | tail -1 | tr -s ' '))"
+}
+
 # =============================================================================
 # payload (inside the allocation)
 # =============================================================================
@@ -383,6 +429,7 @@ setup_run_env() {
         module purge 2>/dev/null || true
     fi
     setup_ffmpeg || exit 1
+    setup_cuda_home || true   # only fatal if deepspeed is installed; the preflight decides
 
     # shellcheck disable=SC1091
     source "$VENV/bin/activate"
@@ -405,7 +452,7 @@ setup_run_env() {
     # arch, the alternative is discovering it as "no kernel image is available" on the loss_w
     # tensor in sonic.py, minutes in and with the traceback buried in a ChildFailedError.
     python - <<'PY' || exit 1
-import torch, sys
+import torch, sys, os
 if not torch.cuda.is_available():
     sys.exit("[preflight] FATAL: torch.cuda.is_available() is False")
 name = torch.cuda.get_device_name(0)
@@ -417,6 +464,23 @@ except RuntimeError as e:
              f"{torch.__version__}\n  {e}\n  Reinstall torch for this arch "
              f"(see CLAUDE.md 'Bringing up a new machine' trap 1).")
 print(f"[preflight] {name} {cap} OK, torch {torch.__version__}")
+
+# accelerate imports deepspeed inside unwrap_model() whenever the package is merely installed,
+# and deepspeed scans its CUDA op builders at import. Do it HERE so a missing nvcc costs 10
+# seconds at startup instead of surfacing at the first evaluate(), 1000 steps in.
+from accelerate.utils.imports import is_deepspeed_available
+if is_deepspeed_available():
+    try:
+        import deepspeed  # noqa: F401
+    except Exception as e:
+        sys.exit(f"[preflight] FATAL: deepspeed is installed but unimportable\n"
+                 f"  {type(e).__name__}: {e}\n"
+                 f"  CUDA_HOME={os.environ.get('CUDA_HOME', '<unset>')}\n"
+                 f"  accelerate's extract_model_from_parallel imports it for an isinstance\n"
+                 f"  check, so this WILL kill the run at its first evaluate(). Either point\n"
+                 f"  PSI0_CUDA_HOME at a toolkit with bin/nvcc, or `uv pip uninstall deepspeed`\n"
+                 f"  -- data_parallel=ddp never constructs a DeepSpeedEngine.")
+    print(f"[preflight] deepspeed {deepspeed.__version__} imports OK")
 PY
 }
 

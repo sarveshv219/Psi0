@@ -386,6 +386,32 @@ settings; flash-attn gets `MAX_JOBS=4` and warns outside an allocation. Escape h
 | `FFMPEG_MODULES` | module names to try, in order (default covers `ffmpeg/4.4`–`6.1.1`) |
 | `PSI0_HF_ONLINE=1` | undo the default `HF_HUB_OFFLINE=1` if a run must reach the hub |
 | `HF_DATASET` | override the dataset repo `mode_data` pulls |
+| `PSI0_CUDA_HOME` | toolkit prefix for deepspeed's import scan; skips the `CUDA_MODULES` hunt |
+
+**A ddp-only run still needs an `nvcc` on the node, because of deepspeed.** This one costs ~1000
+steps to discover. `accelerate`'s `extract_model_from_parallel` does `from deepspeed import
+DeepSpeedEngine` whenever the package is merely *installed* (`is_deepspeed_available()` is a
+`find_spec` + metadata check, `imports.py:163`) — it only wants the class for an `isinstance`
+tuple. Importing deepspeed 0.17.1 runs an op-compatibility scan at module scope
+(`git_version_info.py:29`), and `fp_quantizer.is_compatible()` calls `installed_cuda_version()`
+**without catching** the `MissingCUDAException` it raises when `torch.utils.cpp_extension.CUDA_HOME`
+is `None`. So training runs perfectly and then dies at the **first `evaluate()`**:
+
+```
+deepspeed.ops.op_builder.builder.MissingCUDAException: CUDA_HOME does not exist,
+    unable to compile CUDA op(s)
+```
+
+It never fires on the dev box, which has `/usr/bin/nvcc`. `setup_cuda_home()` handles it: it needs
+only `$CUDA_HOME/bin/nvcc -V` to answer, so it exports **`CUDA_HOME` and nothing else**, reading
+the prefix out of a **subshell** `module load` so the toolkit's `lib64` never reaches this shell's
+`LD_LIBRARY_PATH` — which is searched *before* the RUNPATH torch uses for its bundled CUDA, i.e.
+loading the module for real is exactly the shadowing this file warns against below. It also sets
+`DS_SKIP_CUDA_CHECK=1`, since only the CUDA *major* has to match torch's and nothing is compiled.
+
+The preflight now imports deepspeed too, so a node without `nvcc` fails in 10 s at startup instead
+of at step 1000. If no toolkit exists at all, `uv pip uninstall deepspeed` is safe on this path —
+`data_parallel=ddp` never constructs a `DeepSpeedEngine`; it only forecloses `zero3_offload.json`.
 
 **Job arrays share a node, so torchrun must not pick a fixed port.** `--gres=gpu:l40s:1` leaves
 the other cards on a 2–4 GPU node free, and SLURM packs further array elements onto them. Every
