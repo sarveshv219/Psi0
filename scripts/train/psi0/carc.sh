@@ -48,7 +48,15 @@ SELF=$PSI/scripts/train/psi0/carc.sh
 export PSI_HOME=${PSI_HOME:-$ROOT/psi_home}
 
 WANDB_PROJECT=${WANDB_PROJECT:-psi0-vibe-repose}
-WANDB_ENTITY=${WANDB_ENTITY:-vbp}
+
+# WANDB_ENTITY gets NO default here, deliberately. train.py:4 calls load_dotenv() with the
+# default override=False, whose rule is `if k in os.environ and not override: continue` -- so
+# anything this script exports SILENTLY BEATS .env, and the run lands in whatever org was
+# baked in here. That is why the 5090 launcher works and this one did not: it never sets the
+# variable, so .env is the only source. Leave it unset and let .env decide.
+#
+# "Unset" has to mean unset, not empty: dotenv's test is membership, so an exported
+# WANDB_ENTITY= blocks .env just as effectively as a wrong value would.
 
 # Psi0 is dataloader-hungry where vibe is not: every sample decodes one h264 frame
 # through torchcodec, so CPU per GPU is ~2x vibe's and host memory holds the worker
@@ -218,11 +226,13 @@ mode_setup() {
     # HF_LEROBOT_HOME at directories that do not exist here. Write a fresh one.
     # train.py:4 asserts load_dotenv() is truthy, so an absent OR EMPTY .env is fatal there.
     if [[ ! -f $PSI/.env ]]; then
-        echo "[setup] writing a CARC .env (fill in HF_TOKEN / WANDB_API_KEY)"
+        echo "[setup] writing a CARC .env (fill in HF_TOKEN / WANDB_API_KEY / WANDB_ENTITY)"
         cat > "$PSI/.env" <<EOF
 HF_TOKEN=
 WANDB_API_KEY=
-WANDB_ENTITY=$WANDB_ENTITY
+# Blank = whatever org your API key defaults to. This file is the ONLY place the entity is
+# set; carc.sh deliberately does not, so that it cannot shadow you (load_dotenv is override=False).
+WANDB_ENTITY=${WANDB_ENTITY:-}
 PSI_HOME=$PSI_HOME
 DATA_HOME=$PSI/data
 HF_HOME=$ROOT/cache/hf
@@ -434,8 +444,25 @@ setup_run_env() {
     # shellcheck disable=SC1091
     source "$VENV/bin/activate"
     export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false
-    export WANDB_PROJECT WANDB_ENTITY WANDB_DIR="$PSI/wandb"
+    export WANDB_PROJECT WANDB_DIR="$PSI/wandb"
+    # Only if the operator actually set one (env or `-e`). Exporting an empty value would still
+    # count as "present" to dotenv and suppress .env -- see the note at the top of this file.
+    [[ -n ${WANDB_ENTITY:-} ]] && export WANDB_ENTITY
     export HF_HOME=${HF_HOME:-$ROOT/cache/hf}
+
+    # Resolve the entity the same way train.py will, and say so. wandb silently falls back to
+    # the API key's default org when it has none, so "wrong org" is otherwise only discoverable
+    # in the web UI, after the run has started.
+    local ent src
+    if [[ -n ${WANDB_ENTITY:-} ]]; then
+        ent=$WANDB_ENTITY src="environment (overrides .env)"
+    else
+        ent=$(sed -n 's/^[[:space:]]*WANDB_ENTITY[[:space:]]*=[[:space:]]*//p' "$PSI/.env" 2>/dev/null | tail -1)
+        ent=${ent%\"}; ent=${ent#\"}; ent=${ent%\'}; ent=${ent#\'}
+        src=".env"
+        [[ -z $ent ]] && { ent="<unset>"; src="wandb default for this API key"; }
+    fi
+    echo "[wandb] project=$WANDB_PROJECT entity=$ent (from $src)"
 
     # Every checkpoint and every parquet is on local disk by now, so any hub call is either a
     # revision check that can hang or a rate limit that can 429. Turn both into an immediate

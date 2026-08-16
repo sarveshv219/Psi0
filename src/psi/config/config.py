@@ -26,7 +26,11 @@ class WandbConfig(BaseModel):
 
     def model_post_init(self, __context: Any) -> None:
         if self.entity is None:
-            self.entity = os.getenv("WANDB_ENTITY", None)
+            # `or None`: a blank `WANDB_ENTITY=` line in .env sets the variable to the empty
+            # string, and dotenv's own override test is membership, so empty propagates like a
+            # real value. Passing entity="" to wandb is not the same as passing None -- fold it
+            # back to None so the API key's default org is used.
+            self.entity = os.getenv("WANDB_ENTITY") or None
 
 
 class TrainConfig(BaseModel):

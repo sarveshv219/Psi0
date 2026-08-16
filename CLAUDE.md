@@ -479,6 +479,25 @@ Also note `WANDB_PROJECT`: `WandbConfig.project` is a **CLI flag that defaults t
 `config.py:29`). Exporting `WANDB_PROJECT` alone sends every run to a project called `psi`. Both
 launchers now pass `--wandb.project` explicitly; keep it that way.
 
+**`WANDB_ENTITY` is the mirror-image trap, and `.env` loses it by default.** `train.py:4` calls
+`load_dotenv()` with the default `override=False`, whose rule is literally `if k in os.environ and
+not self.override: continue`. So **any value a launcher exports silently beats `.env`** — and
+"any value" includes the empty string, because the test is membership, not truthiness. `carc.sh`
+used to default it to a lab org and export it, so every CARC run landed there while the 5090
+launcher, which never touches the variable, correctly honoured `.env`. `carc.sh` now sets no
+default and exports it only when non-empty, and prints the resolved value at startup:
+
+```
+[wandb] project=psi0-vibe-repose entity=sarveshv219 (from .env)
+```
+
+Resolution order is CLI `--wandb.entity` → `WANDB_ENTITY` in the environment → `.env` → wandb's
+default org for the API key. A blank `WANDB_ENTITY=` line means that last one; `config.py:29`
+folds `""` to `None` so blank and absent behave identically.
+
+**A `.env` written by an older `mode_setup` still has the baked-in org in it** — the code change
+cannot rewrite a file that already exists. Check it on any machine set up before 2026-08-16.
+
 ## Gotchas
 
 - The SONIC encoder is **SiLU**. `extract_latents.py` reads the activation off
