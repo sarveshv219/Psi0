@@ -72,32 +72,49 @@ N_TRAIN_EP=3246 N_VAL_EP=573
 #
 # Set PSI0_FFMPEG_DIR to a prefix with lib/libavutil.so.5x to skip the module hunt, e.g. a
 # conda env made with: conda create -y -p $ROOT/ffmpeg6 -c conda-forge 'ffmpeg=6.1'
-FFMPEG_MODULES=${FFMPEG_MODULES:-"ffmpeg ffmpeg/6.1.1 ffmpeg/6.0 ffmpeg/5.1.2 ffmpeg/4.4"}
+# Ordered newest-first within torchcodec's supported range (FFmpeg 4-7 -> libavutil.so.56-59).
+# `ffmpeg` bare is LAST on purpose: on an Lmod hierarchy the bare name can resolve only after
+# its compiler prerequisite is loaded, so an explicit version is the more reliable ask.
+FFMPEG_MODULES=${FFMPEG_MODULES:-"ffmpeg/7.0 ffmpeg/6.1.1 ffmpeg/6.1 ffmpeg/6.0 ffmpeg/5.1.2 ffmpeg/4.4 ffmpeg"}
+# Prerequisites to load before ffmpeg when the module tree is hierarchical. Loading a compiler
+# is what makes the ffmpeg/* names visible at all.
+FFMPEG_PREREQS=${FFMPEG_PREREQS:-"usc gcc"}
+
+have_libavutil() {
+    local d
+    ldconfig -p 2>/dev/null | grep -qE 'libavutil\.so\.5[6-9]' && return 0
+    for d in ${LD_LIBRARY_PATH//:/ }; do
+        compgen -G "$d/libavutil.so.5[6-9]" >/dev/null 2>&1 && return 0
+    done
+    return 1
+}
 
 setup_ffmpeg() {
+    # FIRST: is it already here? SLURM propagates the submitting shell's environment
+    # (--export=ALL is the default), so a job usually INHERITS a working ffmpeg. Checking
+    # before touching anything is what stops us from destroying a good environment.
+    if have_libavutil; then echo "[ffmpeg] OK (inherited)"; return 0; fi
+
     if [[ -n ${PSI0_FFMPEG_DIR:-} ]]; then
         export PATH="$PSI0_FFMPEG_DIR/bin:$PATH"
         export LD_LIBRARY_PATH="$PSI0_FFMPEG_DIR/lib:${LD_LIBRARY_PATH:-}"
         echo "[ffmpeg] PSI0_FFMPEG_DIR=$PSI0_FFMPEG_DIR"
     elif command -v module >/dev/null 2>&1; then
         local m
+        for m in $FFMPEG_PREREQS; do module load "$m" 2>/dev/null || true; done
         for m in $FFMPEG_MODULES; do
             module load "$m" 2>/dev/null && { echo "[ffmpeg] module $m"; break; }
         done
     fi
 
-    # Verify rather than hope: this is the exact lookup torchcodec will do, and doing it here
-    # costs a second where failing later costs the job.
-    local found
-    found=$(ldconfig -p 2>/dev/null | grep -oE 'libavutil\.so\.5[6-9]' | head -1)
-    [[ -z $found && -n ${LD_LIBRARY_PATH:-} ]] && found=$(
-        ls ${LD_LIBRARY_PATH//:/ }/libavutil.so.5[6-9] 2>/dev/null | head -1)
-    if [[ -n $found ]]; then
-        echo "[ffmpeg] OK: $found"
+    if have_libavutil; then
+        echo "[ffmpeg] OK: $(ldconfig -p 2>/dev/null | grep -oE 'libavutil\.so\.5[6-9]' | head -1)${LD_LIBRARY_PATH:+ (or on LD_LIBRARY_PATH)}"
     else
         echo "[ffmpeg] FATAL: no libavutil.so.5{6,7,8,9} on the loader path." >&2
         echo "         torchcodec will crash a DataLoader worker on the first batch." >&2
-        echo "         Fix: module spider ffmpeg   OR   set PSI0_FFMPEG_DIR (see comment above)." >&2
+        echo "         Loaded modules:"; module list 2>&1 | sed 's/^/           /' >&2 || true
+        echo "         Fix: module spider ffmpeg, then re-submit with" >&2
+        echo "              FFMPEG_MODULES='ffmpeg/<ver>'   or   PSI0_FFMPEG_DIR=<prefix>" >&2
         return 1
     fi
 }
@@ -336,10 +353,14 @@ mode_sweep() {
 setup_run_env() {
     cd "$PSI"
 
-    # Purge first: a login shell's modules are inherited by the batch script, and a stray
-    # python/cudnn/nccl module is worse than none -- torch bundles its own under
-    # site-packages/nvidia/ and a version-mismatched module silently shadows them.
-    if command -v module >/dev/null 2>&1; then module purge 2>/dev/null || true; fi
+    # DO NOT `module purge` here. SLURM's default --export=ALL means the job inherits the
+    # submitting shell's modules, so a purge throws away a working ffmpeg -- and on an Lmod
+    # hierarchy it also unloads the compiler that makes `ffmpeg/*` visible, so nothing can
+    # reload it. That killed a whole sweep. Set PSI0_MODULE_PURGE=1 only if a stray module is
+    # actually causing trouble, and pass FFMPEG_MODULES with it.
+    if [[ ${PSI0_MODULE_PURGE:-0} = 1 ]] && command -v module >/dev/null 2>&1; then
+        module purge 2>/dev/null || true
+    fi
     setup_ffmpeg || exit 1
 
     # shellcheck disable=SC1091
