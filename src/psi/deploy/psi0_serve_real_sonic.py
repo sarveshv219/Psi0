@@ -103,10 +103,17 @@ class Server:
             states = torch.from_numpy(state_dict["states"].copy())
 
             if self.maxmin.normalize_state: # type:ignore
+                # Guard pad_state_dim the way ActionStateTransform.__call__ itself does
+                # (config/transform.py:59). Unguarded, a config that normalizes state without
+                # padding it -- which is every SONIC-latent run, whose 32-d states already match
+                # odim -- reaches `current_len >= None` inside pad_to_len and raises TypeError.
+                # That lands in this method's except, so the server answers 200 with a status
+                # string and NO action rather than failing; the client sees a missing key.
+                s = states.numpy()
+                if self.maxmin.pad_state_dim is not None: # type:ignore
+                    s = pad_to_len(s, self.maxmin.pad_state_dim, dim=1)[0]
                 states = torch.from_numpy(
-                    self.maxmin.normalize_state_func(
-                        pad_to_len(states.numpy(), self.maxmin.pad_state_dim, dim=1)[0]
-                    )
+                    self.maxmin.normalize_state_func(s)
                 ).to(self.device)
 
             if not self.enable_rtc:

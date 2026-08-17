@@ -498,6 +498,44 @@ folds `""` to `None` so blank and absent behave identically.
 **A `.env` written by an older `mode_setup` still has the baked-in org in it** — the code change
 cannot rewrite a file that already exists. Check it on any machine set up before 2026-08-16.
 
+## Closed-loop deploy: Psi0 plans, SONIC executes
+
+**The seam is `SonicBaseModel._encode_mlp`**, unchanged from songen's deploy path — a 64-d pre-FSQ
+latent replaces the tokenizer encoder's output, leaving FSQ, the decoder, the visual adapter and
+`latent_residual` running as trained.
+
+**Two processes, on purpose.** Psi0 needs ~6.25 GB to infer and mjlab plus the SONIC policy needs
+the rest of an 8 GB card; the two environments also have no compatible dependency set. So:
+
+| side | env | file |
+|---|---|---|
+| planner | `.venv-psi` | `src/psi/deploy/psi0_serve_real_sonic.py`, `scripts/deploy/serve_psi0-rtc-sonic.sh` |
+| sim | `fcrl` | `../vibe/scripts/play_psi0.py` + `psi0_planner.py` |
+
+The client imports no `psi`; the server imports no mjlab. **Every transform stays on the server** —
+resize, centre crop, state normalization, action denormalization all come from the checkpoint's own
+`run_config.json`. The client sends a raw 512×288 uint8 frame and a raw 32-d state and receives
+latents already in pre-FSQ scale. The only thing duplicated is the ~20-line numpy-over-JSON wire
+codec, because importing `psi.deploy.helpers` would drag fastapi across the boundary that exists to
+keep them apart; it is verified byte-exact against the real `helpers.py` in both directions.
+
+**`pad_to_len(x, None)` raises, and the server used to hit it.** `psi0_serve_real_sonic.py` called
+it unconditionally while `pad_state_dim` defaults to `None` — which is every SONIC-latent run,
+whose 32-d states already match `odim`. `current_len >= None` is a `TypeError`, and it lands in
+`predict_action`'s own `except`, so the server answered **200 with a status string and no action**.
+Now guarded the way `ActionStateTransform.__call__` already guards it (`transform.py:59`).
+
+**Four arms, and a number from one alone is unreadable**: `psi0` (the cadence), `psi0-hold` (index
+0 held, isolating the chunk tail), `encoder` (checkpoint untouched — the same-harness ceiling), and
+`mean` (constant training-mean latent — the floor). songen's harness measured this same low-level
+policy landing an *intended* flip 6/55 times on a real recorded slice; most failure in any arm is
+execution, not planning.
+
+**It is not a held-out measurement.** Psi0's val split is 15% of collected *episodes*; the env's
+motion library is a different axis and essentially every clip contributes to both splits. Unlike
+`play_songen.py --samples val`, there is no clip restriction that produces initial conditions Psi0
+never saw. The harness reports `"held_out": false` rather than implying otherwise.
+
 ## Gotchas
 
 - The SONIC encoder is **SiLU**. `extract_latents.py` reads the activation off
