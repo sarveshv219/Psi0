@@ -103,21 +103,35 @@ class RequestMessage(Message):
         )
 
 class ResponseMessage(Message):
-    def __init__(self, action: np.ndarray, err: float, traj_image: np.ndarray = np.zeros((1,1,3), dtype=np.uint8)):
+    """`attn` / `attn_tokens` are OPTIONAL and default to absent.
+
+    They carry the VLM's text->image attention when the server runs with PSI0_ATTN=1. Both are
+    read back with `.get`, so a client or server on either side of this change still interoperates
+    -- an older peer simply sees no attention.
+    """
+
+    def __init__(self, action: np.ndarray, err: float, traj_image: np.ndarray = np.zeros((1,1,3), dtype=np.uint8),
+                 attn: np.ndarray | None = None, attn_tokens: List[str] | None = None):
         self.action = action
         self.err = err
         self.traj_image = traj_image
-    
+        self.attn = attn
+        self.attn_tokens = attn_tokens
+
     def serialize(self):
         msg = {
             "action": self.action,
             "err": self.err,
             "traj_image": self.traj_image
         }
+        if self.attn is not None:
+            msg["attn"] = self.attn
+            msg["attn_tokens"] = self.attn_tokens
         return convert_numpy_in_dict(msg, numpy_serialize)
-    
+
     @classmethod
     def deserialize(cls, response: Dict[str, Any]):
         response = convert_numpy_in_dict(response, numpy_deserialize) # type: ignore
-        return cls(action=response["action"], err=response["err"], traj_image=response["traj_image"])
+        return cls(action=response["action"], err=response["err"], traj_image=response["traj_image"],
+                   attn=response.get("attn"), attn_tokens=response.get("attn_tokens"))
     

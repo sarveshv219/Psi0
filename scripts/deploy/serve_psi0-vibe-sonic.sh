@@ -32,7 +32,12 @@ source .venv-psi/bin/activate
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 export PYTHONUNBUFFERED=1
 
-echo "[serve] $RUN_DIR @ ckpt_$CKPT_STEP -> $IP:$PORT  (GPU $CUDA_VISIBLE_DEVICES, rtc=${RTC:-0})"
+# ATTN=1 serves the VLM's text->image attention alongside the plan. It forces the EAGER
+# attention backend at load (sdpa/flash return attentions=None, with only a warning) and costs
+# one extra VLM forward per plan. Negligible here -- the sequence is 100 tokens.
+export PSI0_ATTN=${ATTN:-0}
+
+echo "[serve] $RUN_DIR @ ckpt_$CKPT_STEP -> $IP:$PORT  (GPU $CUDA_VISIBLE_DEVICES, rtc=${RTC:-0}, attn=${ATTN:-0})"
 python src/psi/deploy/psi0_serve_real_sonic.py \
     --host "$IP" --port "$PORT" \
     --policy psi0 \

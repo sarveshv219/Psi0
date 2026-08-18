@@ -1528,11 +1528,19 @@ class Psi0Model(nn.Module):
         # init empty vlm backbone from config only (skip loading base pretrained weights)
         vlm_config = AutoConfig.from_pretrained(QWEN3VL_VARIANT)
         # Attention backend: flash_attention_2 on CUDA (if installed), sdpa on XPU/CPU.
-        try:
-            from transformers.utils import is_flash_attn_2_available
-            vlm_config._attn_implementation = "flash_attention_2" if is_flash_attn_2_available() else "sdpa"
-        except Exception:
-            vlm_config._attn_implementation = "sdpa"
+        if os.environ.get("PSI0_ATTN") == "1":
+            # Attention maps require eager. sdpa does NOT fall back -- it emits a warning and
+            # returns `attentions=None`, so a server asked for a map would silently ship nothing.
+            # Cost here is negligible: the sequence is 100 tokens, far below where sdpa/flash
+            # tiling pays (same reason flash-attn is optional for this model at all).
+            vlm_config._attn_implementation = "eager"
+            overwatch.info("PSI0_ATTN=1 -> eager attention (sdpa/flash return attentions=None)")
+        else:
+            try:
+                from transformers.utils import is_flash_attn_2_available
+                vlm_config._attn_implementation = "flash_attention_2" if is_flash_attn_2_available() else "sdpa"
+            except Exception:
+                vlm_config._attn_implementation = "sdpa"
         vlm_config.dtype = torch.bfloat16
         vlm_config.vision_config.dtype = torch.bfloat16
         vlm_config.text_config.dtype = torch.bfloat16
