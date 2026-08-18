@@ -142,11 +142,20 @@ class Server:
             assert h * w == len(cols), f"grid {h}x{w} != {len(cols)} image tokens"
 
             rows = torch.arange(int(cols[-1]) + 1, ids.shape[0], device=ids.device)
-            # Last layer, mean over heads. Attention is per-layer and per-head; the last layer is
-            # the one whose output IS hidden_states[-1], i.e. the only thing the action expert
-            # reads, so it is the layer whose routing is causally connected to the plan.
-            a = out.attentions[-1][0].float().mean(0)          # (S, S)
-            m = a[rows][:, cols].reshape(len(rows), h, w)      # (R, h, w)
+            # EVERY layer, mean over heads -> (L, R, h, w). Not the last layer alone.
+            #
+            # The deep layers are an ATTENTION SINK and carry no information. Measured on this
+            # checkpoint, the last layer's colour-token map has argmax at patch (2,9) for a real
+            # frame, a different real frame, random noise AND a pure black image, with pairwise
+            # correlation r = +0.994..+0.996; red vs blue on the same frame is r = +0.9994.
+            # Content-dependence (1 - corr(real frame, black frame)) by layer: 0.74 / 0.66 / 0.61
+            # for layers 0-2, 0.39 at 13, 0.33 at 9, and 0.007-0.064 for every layer from 16 on.
+            #
+            # So the causally relevant layer (27, whose output IS hidden_states[-1]) is precisely
+            # the one that shows nothing, and the informative ones are early. Both facts matter,
+            # so serve all of them and let the panel choose rather than baking in either.
+            A = torch.stack([lyr[0].float().mean(0) for lyr in out.attentions])   # (L, S, S)
+            m = A[:, rows][:, :, cols].reshape(A.shape[0], len(rows), h, w)
             toks = [proc.tokenizer.decode([int(ids[i])]) for i in rows.tolist()]
             return m.cpu().numpy().astype(np.float32), toks
         except Exception:
