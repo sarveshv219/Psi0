@@ -108,10 +108,14 @@ class Server:
             # )
 
             if self.maxmin.normalize_state: # type:ignore
+                # Same guard as psi0_serve_real_sonic.py -- pad_state_dim defaults to None, and
+                # pad_to_len's `current_len >= target_len` is a TypeError against it. Caught by
+                # this method's except, so the server answers 200 with no action.
+                s = states.numpy()
+                if self.maxmin.pad_state_dim is not None: # type:ignore
+                    s = pad_to_len(s, self.maxmin.pad_state_dim, dim=1)[0]
                 states = torch.from_numpy(
-                    self.maxmin.normalize_state_func(
-                        pad_to_len(states.numpy(), self.maxmin.pad_state_dim, dim=1)[0]
-                    )
+                    self.maxmin.normalize_state_func(s)
                 ).to(self.device)
 
             if not self.enable_rtc:
