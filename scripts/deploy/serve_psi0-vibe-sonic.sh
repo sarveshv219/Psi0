@@ -18,8 +18,8 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
-[[ $# -ge 2 ]] || { echo "usage: $0 RUN_DIR CKPT_STEP [PORT]"; exit 2; }
-RUN_DIR=$1 CKPT_STEP=$2 PORT=${3:-8014}
+[[ $# -ge 2 ]] || { echo "usage: $0 RUN_DIR CKPT_STEP [IP] [PORT]"; exit 2; }
+RUN_DIR=$1 CKPT_STEP=$2 IP=${3:-0.0.0.0} PORT=${4:-8014}
 
 [[ -f $RUN_DIR/run_config.json ]] || { echo "[fatal] no run_config.json in $RUN_DIR"; exit 1; }
 [[ -f $RUN_DIR/argv.txt ]]        || { echo "[fatal] no argv.txt in $RUN_DIR"; exit 1; }
@@ -32,9 +32,9 @@ source .venv-psi/bin/activate
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 export PYTHONUNBUFFERED=1
 
-echo "[serve] $RUN_DIR @ ckpt_$CKPT_STEP -> 0.0.0.0:$PORT  (GPU $CUDA_VISIBLE_DEVICES, rtc=${RTC:-0})"
+echo "[serve] $RUN_DIR @ ckpt_$CKPT_STEP -> $IP:$PORT  (GPU $CUDA_VISIBLE_DEVICES, rtc=${RTC:-0})"
 python src/psi/deploy/psi0_serve_real_sonic.py \
-    --host 0.0.0.0 --port "$PORT" \
+    --host "$IP" --port "$PORT" \
     --policy psi0 \
     --run-dir="$RUN_DIR" \
     --ckpt-step="$CKPT_STEP" \
